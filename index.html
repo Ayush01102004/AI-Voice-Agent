@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deepgram Audio Client</title>
+</head>
+
+<body>
+    <h1>Deepgram Audio Client</h1>
+    <button id="startBtn">Start Audio</button>
+    <button id="stopBtn" disabled>Stop Audio</button>
+    <p>Status: <span id="status">Disconnected</span></p>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+
+        let ws = null;
+        let audioContext = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        let nextTime = 0; // Tracks when the next buffer should start
+        const SAMPLE_RATE = 24000; // Matches server configuration (24kHz)
+
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusEl = document.getElementById('status');
+
+
+
+        // Call the function to request microphone access, for example, on a button click
+        // document.getElementById('enableMicButton').addEventListener('click', enableMicrophone);
+
+        function floatTo16BitPCM(input) {
+            const output = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return output;
+        }
+
+        function float32ToInt16PCM(float32Array) {
+            const int16Array = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32Array[i]));
+                int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return int16Array;
+        }
+
+        function processRawPCM(arrayBuffer) {
+            const audioData = new Int16Array(arrayBuffer);
+            const buffer = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+            const channel = buffer.getChannelData(0);
+            for (let i = 0; i < audioData.length; i++) {
+                channel[i] = audioData[i] / 32768;
+            }
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+            source.start();
+        }
+
+
+        async function startAudio() {
+            try {
+
+                ws = new WebSocket('ws://localhost:5002');
+
+                ws.onopen = async () => {
+                    statusEl.textContent = 'Connected';
+                    ws.send(JSON.stringify({ event: 'start' })); // ← add this line
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+
+                    globalStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+
+                    const source = audioContext.createMediaStreamSource(globalStream);
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                    source.connect(processor);
+                    processor.connect(audioContext.destination);
+
+                    processor.onaudioprocess = (e) => {
+                        const floatSamples = e.inputBuffer.getChannelData(0);
+                        const int16 = float32ToInt16PCM(floatSamples);
+                        const base64 = btoa(String.fromCharCode(...new Uint8Array(int16.buffer)));
+                        ws.send(JSON.stringify({ event: 'media', media: { payload: base64 } }));
+                    };
+                };
+
+                ws.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.event === 'audio' && data.media?.payload) {
+                        const binary = atob(data.media.payload);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                        processRawPCM(bytes.buffer);
+                    }
+                };
+
+                ws.onclose = () => {
+                    console.log('Disconnected from WebSocket server');
+                    statusEl.textContent = 'Disconnected';
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
+                    cleanupAudio();
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    statusEl.textContent = 'Error';
+                };
+
+                // Initialize AudioContext
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                nextTime = audioContext.currentTime; // Initialize playback time
+            } catch (error) {
+                console.error('Error starting audio:', error);
+                statusEl.textContent = 'Error';
+            }
+        }
+
+        function processRawPCM(arrayBuffer) {
+            try {
+                // Convert raw PCM (linear16) to AudioBuffer
+                const audioData = new Int16Array(arrayBuffer);
+                const audioBuffer = audioContext.createBuffer(1, audioData.length, SAMPLE_RATE);
+                const channelData = audioBuffer.getChannelData(0);
+
+                // Convert int16 to float32
+                for (let i = 0; i < audioData.length; i++) {
+                    channelData[i] = audioData[i] / 32768; // Normalize to -1.0 to 1.0
+                }
+
+                queueAudio(audioBuffer);
+            } catch (error) {
+                console.error('Error processing PCM audio:', error);
+            }
+        }
+
+        function queueAudio(audioBuffer) {
+            audioQueue.push(audioBuffer);
+            if (!isPlaying) {
+                playNext();
+            }
+        }
+
+        function playNext() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+
+            isPlaying = true;
+            const buffer = audioQueue.shift();
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+
+            // Schedule playback to avoid gaps
+            const bufferDuration = buffer.length / SAMPLE_RATE;
+            source.start(nextTime);
+            nextTime += bufferDuration; // Schedule next buffer
+
+            source.onended = () => {
+                // Only proceed to next buffer if queue isn't empty
+                if (audioQueue.length > 0) {
+                    playNext();
+                } else {
+                    isPlaying = false;
+                }
+            };
+        }
+
+        function cleanupAudio() {
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            audioQueue = [];
+            isPlaying = false;
+            nextTime = 0;
+        }
+
+        startBtn.addEventListener('click', startAudio);
+        stopBtn.addEventListener('click', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+
+        async function fetchWeatherData(city, country = '') {
+            try {
+                // const location = country ? `${city},${country}` : city;
+                let url = 'http://127.0.0.1:8787/api/menu-items'
+
+                const response = await axios.get(`${url}`, {
+                    params: {
+                        format: 'j1' // JSON format
+                    }
+                });
+
+                const data = response.data;
+                const current = data.current_condition[0];
+                const area = data.nearest_area[0];
+
+                return {
+                    success: true,
+
+                };
+            } catch (error) {
+                console.error('Restro API Error:', error.response?.data || error.message);
+
+                // Fallback to simple text format if JSON fails
+
+            }
+        }
+        // enableMicrophone()
+    </script>
+</body>
+
+</html>
