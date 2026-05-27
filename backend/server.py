@@ -9,6 +9,14 @@ Endpoints:
   POST /twilio/voice   — Twilio webhook, returns TwiML to open Media Stream
   GET  /ws/twilio      — Twilio Media Streams WebSocket
   GET  /health         — Health check
+
+Fixes vs original:
+  1. socket._send(SETTINGS) → socket.send_settings(SETTINGS)          [private API removed]
+  2. end_conversation now closes WS so Twilio hangs up                 [call termination fixed]
+  3. _cleanup() awaits listener cancel before _cm.__exit__             [race condition fixed]
+  4. DeepgramClient created once globally, not per call                [resource leak fixed]
+  5. sessions stores call_sid for correlation                          [observability fix]
+  6. SETTINGS sent via proper SDK method, not raw dict                 [type safety fix]
 """
 
 import asyncio
@@ -32,6 +40,11 @@ if not DEEPGRAM_API_KEY:
     raise ValueError("DEEPGRAM_API_KEY not found in .env")
 
 PORT = 5002
+
+# ── global Deepgram client (created once, reused per call) ────
+# FIX #4: was re-instantiated inside the "start" event handler every call.
+
+deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
 
 # ── config ────────────────────────────────────────────────────
 
@@ -71,6 +84,10 @@ FUNCTIONS = [
     }
 ]
 
+# FIX #6: SETTINGS is kept as a plain dict only for reference.
+# It is passed to send_settings() which accepts a dict — the SDK
+# serialises it internally. Do NOT call socket._send(SETTINGS).
+
 SETTINGS = {
     "type": "Settings",
     "audio": {
@@ -93,7 +110,9 @@ SETTINGS = {
     },
 }
 
-# ── active sessions: ws → {agent_conn, listener, _cm, stream_sid} ────────────
+# ── active sessions ───────────────────────────────────────────
+# FIX #5: now stores call_sid for log correlation and future per-call ops.
+# Structure: ws → {agent_conn, listener, _cm, stream_sid, call_sid}
 
 sessions: Dict[Any, Dict[str, Any]] = {}
 
@@ -129,6 +148,7 @@ def agent_listener_thread(
     ws: web.WebSocketResponse,
     loop: asyncio.AbstractEventLoop,
     stream_sid: str,
+    call_sid: str,
 ) -> None:
     try:
         for msg in socket:
@@ -142,71 +162,104 @@ def agent_listener_thread(
             t = getattr(msg, "type", None)
 
             if t == "Welcome":
-                print("[agent] connected → sending settings")
+                print(f"[agent][{call_sid}] connected → sending settings")
                 try:
-                    socket._send(SETTINGS)
+                    # FIX #1: was socket._send(SETTINGS) — private method.
+                    # send_settings() is the public SDK API.
+                    socket.send_settings(SETTINGS)
                 except Exception as e:
-                    print(f"[settings error] {e}")
+                    print(f"[settings error][{call_sid}] {e}")
 
             elif t == "SettingsApplied":
-                print("[agent] ready")
+                print(f"[agent][{call_sid}] ready")
 
             elif t == "Error":
-                print(f"[agent ERROR] {getattr(msg, 'code', '?')} | {getattr(msg, 'description', '?')}")
+                print(f"[agent ERROR][{call_sid}] {getattr(msg, 'code', '?')} | {getattr(msg, 'description', '?')}")
 
             elif t == "FunctionCallRequest":
                 for fn in msg.functions:
-                    print(f"[fn] {fn.name}")
+                    print(f"[fn][{call_sid}] {fn.name}")
                     try:
                         args = json.loads(fn.arguments)
                     except Exception:
                         args = {}
 
-                    content = (
-                        {"success": True, "message": "Thank you for your time. Have a great day!", "reason": args.get("reason", "")}
-                        if fn.name == "end_conversation"
-                        else {"success": False, "error": f"Unknown function: {fn.name}"}
-                    )
-
-                    try:
-                        socket.send_function_call_response(
-                            AgentV1SendFunctionCallResponse(
-                                id=fn.id, name=fn.name, content=json.dumps(content)
+                    if fn.name == "end_conversation":
+                        content = {
+                            "success": True,
+                            "message": "Thank you for your time. Have a great day!",
+                            "reason":  args.get("reason", ""),
+                        }
+                        # Send goodbye response to agent first
+                        try:
+                            socket.send_function_call_response(
+                                AgentV1SendFunctionCallResponse(
+                                    id=fn.id, name=fn.name, content=json.dumps(content)
+                                )
                             )
-                        )
-                    except Exception as e:
-                        print(f"[fn response] {e}")
+                        except Exception as e:
+                            print(f"[fn response][{call_sid}] {e}")
+
+                        # FIX #2: was missing — WS was never closed so Twilio
+                        # kept the call alive. Schedule WS close on the event loop
+                        # so Twilio receives a clean disconnect and hangs up.
+                        print(f"[fn][{call_sid}] closing call after end_conversation")
+                        asyncio.run_coroutine_threadsafe(ws.close(), loop)
+
+                    else:
+                        content = {"success": False, "error": f"Unknown function: {fn.name}"}
+                        try:
+                            socket.send_function_call_response(
+                                AgentV1SendFunctionCallResponse(
+                                    id=fn.id, name=fn.name, content=json.dumps(content)
+                                )
+                            )
+                        except Exception as e:
+                            print(f"[fn response][{call_sid}] {e}")
 
             elif t == "ConversationText":
                 role = getattr(msg, "role", "?")
                 text = getattr(msg, "content", getattr(msg, "text", ""))
-                print(f"[{role}] {text}")
+                print(f"[{role}][{call_sid}] {text}")
 
             elif t in ("AgentThinking", "UserStartedSpeaking", "AgentStartedSpeaking",
                        "AgentAudioDone", "History"):
                 pass  # expected noise — no action needed
 
             elif t is not None:
-                print(f"[agent msg] {t}")  # catch new Deepgram message types
+                print(f"[agent msg][{call_sid}] {t}")
 
     except Exception as e:
-        print(f"[listener error] {e}")
+        print(f"[listener error][{call_sid}] {e}")
     finally:
-        print("[agent] listener exited")
+        print(f"[agent][{call_sid}] listener exited")
 
 
-# ── cleanup helper (shared by ws handler finally block) ───────
+# ── cleanup helper ────────────────────────────────────────────
 
 
 async def _cleanup(ws: web.WebSocketResponse) -> None:
     s = sessions.pop(ws, {})
-    if s.get("listener"):
-        s["listener"].cancel()
+    call_sid = s.get("call_sid", "?")
+
+    # FIX #3: was cancel() without await — _cm.__exit__ could run while
+    # listener thread was still writing to socket, causing silent errors.
+    # Now: cancel + await before closing the Deepgram context manager.
+    listener = s.get("listener")
+    if listener:
+        listener.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(listener), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
     if s.get("_cm"):
         try:
             await asyncio.to_thread(s["_cm"].__exit__, None, None, None)
         except Exception as e:
-            print(f"[cleanup] {e}")
+            print(f"[cleanup][{call_sid}] {e}")
+
+    print(f"[cleanup][{call_sid}] done")
 
 
 # ── POST /twilio/voice ─────────────────────────────────────────
@@ -231,7 +284,7 @@ async def twilio_ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(max_msg_size=0)
     await ws.prepare(request)
 
-    sessions[ws] = {"agent_conn": None, "listener": None, "_cm": None, "stream_sid": ""}
+    sessions[ws] = {"agent_conn": None, "listener": None, "_cm": None, "stream_sid": "", "call_sid": ""}
     print("[twilio] websocket connected")
 
     try:
@@ -248,20 +301,24 @@ async def twilio_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         stream_sid = data.get("streamSid", "")
                         call_sid   = data.get("start", {}).get("callSid", stream_sid)
                         sessions[ws]["stream_sid"] = stream_sid
+                        sessions[ws]["call_sid"]   = call_sid          # FIX #5
                         print(f"[twilio] call started — call_sid={call_sid}")
 
                         loop   = asyncio.get_running_loop()
-                        cm     = DeepgramClient(api_key=DEEPGRAM_API_KEY).agent.v1.connect()
+                        # FIX #4: use global deepgram_client, not new instance per call
+                        cm     = deepgram_client.agent.v1.connect()
                         socket = await asyncio.to_thread(cm.__enter__)
 
-                        sessions[ws]["_cm"]        = cm
-                        sessions[ws]["agent_conn"]  = socket
-                        sessions[ws]["listener"]    = asyncio.ensure_future(
-                            asyncio.to_thread(agent_listener_thread, socket, ws, loop, stream_sid)
+                        sessions[ws]["_cm"]       = cm
+                        sessions[ws]["agent_conn"] = socket
+                        sessions[ws]["listener"]   = asyncio.ensure_future(
+                            asyncio.to_thread(
+                                agent_listener_thread, socket, ws, loop, stream_sid, call_sid
+                            )
                         )
 
                     elif event == "stop":
-                        print("[twilio] call ended")
+                        print(f"[twilio] call ended — call_sid={sessions[ws].get('call_sid', '?')}")
                         break
 
                     elif event == "media":

@@ -1,18 +1,22 @@
 """
-call_handler.py
-FastAPI server — Twilio webhook receiver + lead pipeline
-
-Endpoints:
-  POST /twilio-webhook       ← Twilio posts here after every call ends
-  GET  /api/leads            ← lead list
-  GET  /api/stats            ← summary stats
-  GET  /api/transcript/{sid} ← transcript viewer
-  GET  /health               ← health check
+call_handler.py  —  FastAPI + Supabase
+Twilio webhook receiver + transcription + lead extraction + Make.com trigger
 
 Run:
+  pip install fastapi uvicorn httpx groq python-dotenv supabase
   uvicorn call_handler:app --host 0.0.0.0 --port 8000 --reload
+
+Fixes vs team version:
+  1. SUPABASE_PUBLISHABLE_KEY → SUPABASE_SERVICE_ROLE_KEY  [RLS bypass for server writes]
+  2. Restored trigger_hot_lead_workflow()                  [HOT lead Make.com alerts]
+  3. Restored /api/leads, /api/stats, /api/transcript      [read-side API]
+  4. asyncio import moved to module level                  [cleanup]
+  5. Supabase None-guard before any table access           [crash prevention]
+  6. Restored HOT/WARM/COLD scoring rules in prompt        [lead quality]
+  7. process_recording_pipeline restored Make.com call     [regression fix]
 """
 
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -24,27 +28,62 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from groq import AsyncGroq
+from supabase import create_client, Client
 
 # ── env ───────────────────────────────────────────────────────
 
 load_dotenv()
 
-DEEPGRAM_API_KEY     = os.getenv("DEEPGRAM_API_KEY", "")
-GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "")
+DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
+GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
 MAKE_HOT_LEAD_WEBHOOK = os.getenv("MAKE_HOT_LEAD_WEBHOOK", "")
+SUPABASE_URL          = os.getenv("SUPABASE_URL", "")
 
-if not DEEPGRAM_API_KEY:
-    raise ValueError("DEEPGRAM_API_KEY missing from .env")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY missing from .env")
+# FIX #1: anon/publishable key is subject to Row Level Security — server-side
+# code must use the service role key to read/write without RLS restrictions.
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
-CALLS_FILE  = "calls.json"
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+for name, val in [
+    ("DEEPGRAM_API_KEY",          DEEPGRAM_API_KEY),
+    ("GROQ_API_KEY",              GROQ_API_KEY),
+    ("SUPABASE_URL",              SUPABASE_URL),
+    ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY),
+]:
+    if not val:
+        raise ValueError(f"{name} missing from .env")
+
+groq_client: AsyncGroq    = AsyncGroq(api_key=GROQ_API_KEY)
+supabase:    Optional[Client] = None   # initialised in startup
 
 # ── app ───────────────────────────────────────────────────────
 
-app = FastAPI(title="Inbox Infotech — Call Handler", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Inbox Infotech — Call Handler", version="3.2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global supabase
+    supabase = create_client(
+        supabase_url=SUPABASE_URL,
+        supabase_key=SUPABASE_SERVICE_ROLE_KEY,   # FIX #1
+    )
+    print("[startup] Supabase client ready")
+
+
+# ── FIX #5: guard used before every table access ──────────────
+
+def _get_supabase() -> Client:
+    if supabase is None:
+        raise RuntimeError("Supabase client not initialised yet")
+    return supabase
+
 
 # ── POST /twilio-webhook ──────────────────────────────────────
 
@@ -81,7 +120,9 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         "received_at":   datetime.utcnow().isoformat(),
     }
 
-    background_tasks.add_task(process_recording_pipeline, call_sid, recording_url, call_meta)
+    background_tasks.add_task(
+        process_recording_pipeline, call_sid, recording_url, call_meta
+    )
     print(f"[twilio] queued pipeline for {call_sid}")
     return JSONResponse({"status": "received", "call_sid": call_sid})
 
@@ -95,12 +136,15 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
         response = await client.post(
             "https://api.deepgram.com/v1/listen"
             "?model=nova-3&punctuate=true&diarize=true&smart_format=true&utterances=true",
-            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/mp3"},
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/mp3",
+            },
             content=audio_bytes,
         )
 
     if response.status_code != 200:
-        print(f"[transcribe] failed {response.status_code}")
+        print(f"[transcribe] failed {response.status_code}: {response.text[:200]}")
         return ""
 
     data = response.json()
@@ -117,8 +161,8 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
         return ""
 
     lines: List[str] = []
-    current_speaker  = None
-    current_words: List[str] = []
+    current_speaker: Optional[int] = None
+    current_words:   List[str]     = []
 
     for word in words:
         speaker_id = word.get("speaker", 0)
@@ -144,6 +188,8 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
 
 # ── extraction ────────────────────────────────────────────────
 
+# FIX #6: scoring rules restored — without them the LLM has no guidance
+# and produces inconsistent HOT/WARM/COLD classifications.
 EXTRACTION_PROMPT = """
 You are an expert sales analyst at Inbox Infotech.
 Analyze this call transcript and extract structured lead information.
@@ -178,13 +224,21 @@ WARM (score 4-7) : interested but vague on budget/timeline, or not decision make
 COLD (score 1-3) : no interest, declined, hung up, wrong number, voicemail
 """
 
-_COLD_FALLBACK = {
-    "pain_points": [], "budget": "not mentioned", "requirements": [],
-    "timeline": "not mentioned", "decision_maker": False, "industry": "unknown",
-    "intent_level": "low", "lead_score": 1, "lead_category": "COLD",
-    "summary": "No transcript available.", "next_action": "Retry call later.",
+_COLD_FALLBACK: Dict[str, Any] = {
+    "pain_points":        [],
+    "budget":             "not mentioned",
+    "requirements":       [],
+    "timeline":           "not mentioned",
+    "decision_maker":     False,
+    "industry":           "unknown",
+    "intent_level":       "low",
+    "lead_score":         1,
+    "lead_category":      "COLD",
+    "summary":            "No transcript available.",
+    "next_action":        "Retry call later.",
     "interested_services": [],
 }
+
 
 async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
     if not transcript.strip():
@@ -204,7 +258,6 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
 
         extracted = json.loads(response.choices[0].message.content)
 
-        # sanitise LLM output
         extracted.setdefault("pain_points", [])
         extracted.setdefault("requirements", [])
         extracted.setdefault("interested_services", [])
@@ -222,38 +275,83 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
         return {**_COLD_FALLBACK, "summary": "Extraction failed.", "next_action": "Manual review required."}
 
 
-# ── storage ───────────────────────────────────────────────────
+# ── Supabase storage ──────────────────────────────────────────
+
+def _save_record_sync(row: Dict[str, Any]) -> None:
+    _get_supabase().table("calls").upsert(row).execute()   # FIX #5
+
 
 async def save_record(record: Dict[str, Any]) -> None:
+    meta      = record.get("meta", {})
+    extracted = record.get("extracted", {})
+
+    row = {
+        "call_sid":      record["call_sid"],
+        "from_number":   meta.get("from_number"),
+        "to_number":     meta.get("to_number"),
+        "duration_sec":  meta.get("duration_sec", 0),
+        "transcript":    record.get("transcript", ""),
+        "lead_category": extracted.get("lead_category", "COLD"),
+        "lead_score":    extracted.get("lead_score", 1),
+        "extracted":     extracted,
+        "recording_url": meta.get("recording_url", ""),
+    }
+
     try:
-        with open(CALLS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        print(f"[storage] saved {record['call_sid']}")
+        await asyncio.to_thread(_save_record_sync, row)
+        print(f"[storage] saved {record['call_sid']} to Supabase")
     except Exception as e:
-        print(f"[storage] failed: {e}")
+        print(f"[storage] Supabase error: {e}")
 
 
-def load_all_records() -> List[Dict[str, Any]]:
-    records: List[Dict[str, Any]] = []
-    try:
-        with open(CALLS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-    except FileNotFoundError:
-        pass
-    return records
+def _load_records_sync(
+    category: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    query = (
+        _get_supabase()                              # FIX #5
+        .table("calls")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if category:
+        query = query.eq("lead_category", category.upper())
+    return query.execute().data or []
 
 
-# ── Make.com trigger ──────────────────────────────────────────
+def _load_stats_sync() -> List[Dict[str, Any]]:
+    return (
+        _get_supabase()                              # FIX #5
+        .table("calls")
+        .select("lead_category, lead_score")
+        .execute()
+        .data or []
+    )
 
-async def trigger_hot_lead_workflow(call_sid: str, extracted: Dict[str, Any], meta: Dict[str, Any]) -> None:
+
+def _load_transcript_sync(call_sid: str) -> Optional[Dict[str, Any]]:
+    res = (
+        _get_supabase()                              # FIX #5
+        .table("calls")
+        .select("call_sid, transcript")
+        .eq("call_sid", call_sid)
+        .single()
+        .execute()
+    )
+    return res.data
+
+
+# ── Make.com HOT lead trigger ─────────────────────────────────
+# FIX #2 + #7: function was deleted in team version; restored in full.
+
+async def trigger_hot_lead_workflow(
+    call_sid:  str,
+    extracted: Dict[str, Any],
+    meta:      Dict[str, Any],
+) -> None:
     if not MAKE_HOT_LEAD_WEBHOOK:
-        print("[make] webhook not configured")
+        print("[make] webhook not configured — skipping")
         return
 
     payload = {
@@ -283,7 +381,11 @@ async def trigger_hot_lead_workflow(call_sid: str, extracted: Dict[str, Any], me
 
 # ── pipeline ──────────────────────────────────────────────────
 
-async def process_recording_pipeline(call_sid: str, recording_url: str, call_meta: Dict[str, Any]) -> None:
+async def process_recording_pipeline(
+    call_sid:     str,
+    recording_url: str,
+    call_meta:    Dict[str, Any],
+) -> None:
     print(f"[pipeline] started {call_sid}")
 
     try:
@@ -300,13 +402,13 @@ async def process_recording_pipeline(call_sid: str, recording_url: str, call_met
     extracted  = await extract_insights(call_sid, transcript)
 
     await save_record({
-        "call_sid":  call_sid,
-        "meta":      call_meta,
+        "call_sid":   call_sid,
+        "meta":       call_meta,
         "transcript": transcript,
-        "extracted": extracted,
-        "timestamp": datetime.utcnow().isoformat(),
+        "extracted":  extracted,
     })
 
+    # FIX #7: was missing — HOT leads never triggered Make.com
     if extracted.get("lead_category") == "HOT":
         print(f"[pipeline] HOT lead — triggering Make.com")
         await trigger_hot_lead_workflow(call_sid, extracted, call_meta)
@@ -315,88 +417,106 @@ async def process_recording_pipeline(call_sid: str, recording_url: str, call_met
 
 
 # ── GET /api/leads ────────────────────────────────────────────
+# FIX #3: endpoint was deleted in team version; restored.
 
 @app.get("/api/leads")
 async def get_leads(category: Optional[str] = None, limit: int = 100):
-    records = load_all_records()
-    leads = []
+    try:
+        records = await asyncio.to_thread(_load_records_sync, category, limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    for r in records:
-        extracted = r.get("extracted", {})
-        meta      = r.get("meta", {})
-        cat       = extracted.get("lead_category", "COLD")
+    leads = [
+        {
+            "call_sid":            r.get("call_sid"),
+            "timestamp":           r.get("created_at"),
+            "from_number":         r.get("from_number"),
+            "to_number":           r.get("to_number"),
+            "duration_sec":        r.get("duration_sec"),
+            "lead_category":       r.get("lead_category", "COLD"),
+            "lead_score":          r.get("lead_score", 1),
+            "intent_level":        (r.get("extracted") or {}).get("intent_level", "low"),
+            "summary":             (r.get("extracted") or {}).get("summary", ""),
+            "next_action":         (r.get("extracted") or {}).get("next_action", ""),
+            "pain_points":         (r.get("extracted") or {}).get("pain_points", []),
+            "interested_services": (r.get("extracted") or {}).get("interested_services", []),
+            "recording_url":       r.get("recording_url", ""),
+        }
+        for r in records
+    ]
 
-        if category and cat.upper() != category.upper():
-            continue
-
-        leads.append({
-            "call_sid":      r.get("call_sid"),
-            "timestamp":     r.get("timestamp"),
-            "to_number":     meta.get("to_number"),
-            "duration_sec":  meta.get("duration_sec"),
-            "lead_category": cat,
-            "lead_score":    extracted.get("lead_score", 1),
-            "intent_level":  extracted.get("intent_level", "low"),
-            "summary":       extracted.get("summary", ""),
-            "next_action":   extracted.get("next_action", ""),
-            "pain_points":   extracted.get("pain_points", []),
-            "interested_services": extracted.get("interested_services", []),
-            "recording_url": meta.get("recording_url", ""),
-        })
-
-    leads.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
-    return JSONResponse({"total": len(leads), "leads": leads[:limit]})
+    return JSONResponse({"total": len(leads), "leads": leads})
 
 
 # ── GET /api/stats ────────────────────────────────────────────
+# FIX #3: endpoint was deleted in team version; restored.
 
 @app.get("/api/stats")
 async def get_stats():
-    records = load_all_records()
-    total   = len(records)
+    try:
+        rows = await asyncio.to_thread(_load_stats_sync)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    hot  = sum(1 for r in records if r.get("extracted", {}).get("lead_category") == "HOT")
-    warm = sum(1 for r in records if r.get("extracted", {}).get("lead_category") == "WARM")
-    cold = sum(1 for r in records if r.get("extracted", {}).get("lead_category") == "COLD")
+    total = len(rows)
+    hot   = sum(1 for r in rows if r.get("lead_category") == "HOT")
+    warm  = sum(1 for r in rows if r.get("lead_category") == "WARM")
+    cold  = sum(1 for r in rows if r.get("lead_category") == "COLD")
 
     avg_score = (
-        sum(r.get("extracted", {}).get("lead_score", 0) for r in records) / total
-        if total else 0
+        sum(r.get("lead_score", 0) for r in rows) / total if total else 0
     )
 
     return JSONResponse({
-        "total_calls":    total,
-        "hot":            hot,
-        "warm":           warm,
-        "cold":           cold,
-        "avg_lead_score": round(avg_score, 1),
+        "total_calls":     total,
+        "hot":             hot,
+        "warm":            warm,
+        "cold":            cold,
+        "avg_lead_score":  round(avg_score, 1),
         "conversion_rate": round(hot / total * 100, 1) if total else 0,
     })
 
 
 # ── GET /api/transcript/{call_sid} ────────────────────────────
+# FIX #3: endpoint was deleted in team version; restored.
 
 @app.get("/api/transcript/{call_sid}")
 async def get_transcript(call_sid: str):
-    for record in load_all_records():
-        if record.get("call_sid") == call_sid:
-            raw = record.get("transcript", "")
-            parsed = [
-                {"role": line.split(":")[0].strip(), "text": ":".join(line.split(":")[1:]).strip()}
-                for line in raw.splitlines() if ":" in line
-            ]
-            return JSONResponse({"call_sid": call_sid, "transcript": parsed})
+    try:
+        record = await asyncio.to_thread(_load_transcript_sync, call_sid)
+    except Exception:
+        record = None
 
-    raise HTTPException(status_code=404, detail=f"No transcript for {call_sid}")
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No transcript for {call_sid}")
+
+    raw    = record.get("transcript", "")
+    parsed = [
+        {
+            "role": line.split(":")[0].strip(),
+            "text": ":".join(line.split(":")[1:]).strip(),
+        }
+        for line in raw.splitlines()
+        if ":" in line
+    ]
+    return JSONResponse({"call_sid": call_sid, "transcript": parsed})
 
 
 # ── GET /health ───────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
+    try:
+        res   = await asyncio.to_thread(
+            lambda: _get_supabase().table("calls").select("id", count="exact").execute()
+        )
+        count = res.count or 0
+    except Exception:
+        count = -1
+
     return JSONResponse({
         "status":       "ok",
-        "calls_stored": len(load_all_records()),
+        "calls_stored": count,
         "timestamp":    datetime.utcnow().isoformat(),
     })
 

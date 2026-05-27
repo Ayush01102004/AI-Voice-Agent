@@ -8,3 +8,5 @@ openai
 python-dotenv
 aiohttp
 groq
+twilio
+supabase==2.4.2 
