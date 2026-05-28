@@ -3,10 +3,10 @@
 import { createClient } from '@supabase/supabase-js'
 
 const SUPABASE_URL  = import.meta.env.VITE_SUPABASE_URL
-const SUPABASE_ANON = import.meta.env.VITE_SUPABASE_ANON_KEY
+const SUPABASE_PUBLISHABLE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
 
-if (!SUPABASE_URL || !SUPABASE_ANON) {
-  throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY in .env')
+if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
+  throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_PUBLISHABLE_KEY in .env')
 }
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON)
+export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)

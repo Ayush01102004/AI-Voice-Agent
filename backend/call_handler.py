@@ -6,19 +6,19 @@ Run:
   pip install fastapi uvicorn httpx groq python-dotenv supabase
   uvicorn call_handler:app --host 0.0.0.0 --port 8000 --reload
 
-Fixes vs team version:
-  1. SUPABASE_PUBLISHABLE_KEY → SUPABASE_SERVICE_ROLE_KEY  [RLS bypass for server writes]
-  2. Restored trigger_hot_lead_workflow()                  [HOT lead Make.com alerts]
-  3. Restored /api/leads, /api/stats, /api/transcript      [read-side API]
-  4. asyncio import moved to module level                  [cleanup]
-  5. Supabase None-guard before any table access           [crash prevention]
-  6. Restored HOT/WARM/COLD scoring rules in prompt        [lead quality]
-  7. process_recording_pipeline restored Make.com call     [regression fix]
+Upgrades vs v3.2.0:
+  8. source field written to calls table         [Top Sources chart support]
+  9. name extracted from transcript + saved      [Leads page name column]
+  10. lifespan replaces deprecated on_event()   [FastAPI v0.93+ clean startup]
+  11. system_prompt fetched from agent_config DB [no more hardcoded prompt]
+  12. agent_config cache with TTL=5min           [prompt edits apply fast]
 """
 
 import asyncio
 import json
 import os
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -38,9 +38,6 @@ DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
 GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
 MAKE_HOT_LEAD_WEBHOOK = os.getenv("MAKE_HOT_LEAD_WEBHOOK", "")
 SUPABASE_URL          = os.getenv("SUPABASE_URL", "")
-
-# FIX #1: anon/publishable key is subject to Row Level Security — server-side
-# code must use the service role key to read/write without RLS restrictions.
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 for name, val in [
@@ -52,12 +49,110 @@ for name, val in [
     if not val:
         raise ValueError(f"{name} missing from .env")
 
-groq_client: AsyncGroq    = AsyncGroq(api_key=GROQ_API_KEY)
-supabase:    Optional[Client] = None   # initialised in startup
+groq_client: AsyncGroq       = AsyncGroq(api_key=GROQ_API_KEY)
+supabase:    Optional[Client] = None  # initialised in lifespan
+
+# ── UPGRADE #12: agent_config cache ──────────────────────────
+# Fetched once at startup, refreshed every TTL seconds so prompt
+# edits from the dashboard apply without a server restart.
+
+_CONFIG_CACHE: Dict[str, str] = {}
+_CONFIG_CACHE_TS: float = 0.0
+_CONFIG_TTL: float = 300.0  # 5 minutes
+
+# Fallback prompt — only used if agent_config table is empty/unreachable
+_DEFAULT_SYSTEM_PROMPT = """
+You are a friendly and confident sales caller from Inbox Infotech.
+You are speaking naturally on a real-time phone call.
+
+STYLE:
+- Speak naturally like a real human
+- Keep replies short and conversational
+- Be slightly persuasive, avoid long explanations
+
+RULES:
+- Never sound robotic or repeat yourself
+- Stay concise and relevant
+
+SERVICES:
+- AI / ML Development | IoT Solutions | CRM / ERP
+- Mobile & Web Development | Cloud & DevOps
+- API Integration | Automation Solutions
+
+GOAL:
+Understand customer needs and guide the conversation naturally.
+""".strip()
+
+
+def _fetch_agent_config_sync() -> Dict[str, str]:
+    """Fetch all agent_config rows synchronously (called via to_thread)."""
+    rows = (
+        _get_supabase()
+        .table("agent_config")
+        .select("key, value")
+        .execute()
+        .data or []
+    )
+    return {r["key"]: r["value"] for r in rows}
+
+
+async def get_agent_config(force: bool = False) -> Dict[str, str]:
+    """Return cached agent_config, refreshing if stale or forced."""
+    global _CONFIG_CACHE, _CONFIG_CACHE_TS
+    now = time.monotonic()
+    if force or not _CONFIG_CACHE or (now - _CONFIG_CACHE_TS) > _CONFIG_TTL:
+        try:
+            _CONFIG_CACHE = await asyncio.to_thread(_fetch_agent_config_sync)
+            _CONFIG_CACHE_TS = now
+            print(f"[config] refreshed — {len(_CONFIG_CACHE)} keys")
+        except Exception as e:
+            print(f"[config] fetch failed, using cache/defaults: {e}")
+    return _CONFIG_CACHE
+
+
+async def get_system_prompt() -> str:
+    """Return system_prompt from DB, falling back to hardcoded default."""
+    cfg = await get_agent_config()
+    prompt = cfg.get("system_prompt", "").strip()
+    if not prompt:
+        print("[config] system_prompt not in DB — using default")
+        return _DEFAULT_SYSTEM_PROMPT
+    return prompt
+
+
+# ── UPGRADE #10: lifespan replaces deprecated @on_event ───────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── startup ──
+    global supabase
+    supabase = create_client(
+        supabase_url=SUPABASE_URL,
+        supabase_key=SUPABASE_SERVICE_ROLE_KEY,
+    )
+    print("[startup] Supabase client ready")
+
+    # Pre-warm config cache so first call has the prompt immediately
+    try:
+        await get_agent_config(force=True)
+        prompt_preview = (await get_system_prompt())[:80].replace("\n", " ")
+        print(f"[startup] system_prompt loaded: '{prompt_preview}…'")
+    except Exception as e:
+        print(f"[startup] config pre-warm failed: {e}")
+
+    yield  # app runs
+
+    # ── shutdown ──
+    print("[shutdown] clean exit")
+
 
 # ── app ───────────────────────────────────────────────────────
 
-app = FastAPI(title="Inbox Infotech — Call Handler", version="3.2.0")
+app = FastAPI(
+    title="Inbox Infotech — Call Handler",
+    version="3.3.0",
+    lifespan=lifespan,         # UPGRADE #10
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,17 +162,7 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def startup() -> None:
-    global supabase
-    supabase = create_client(
-        supabase_url=SUPABASE_URL,
-        supabase_key=SUPABASE_SERVICE_ROLE_KEY,   # FIX #1
-    )
-    print("[startup] Supabase client ready")
-
-
-# ── FIX #5: guard used before every table access ──────────────
+# ── Supabase guard ────────────────────────────────────────────
 
 def _get_supabase() -> Client:
     if supabase is None:
@@ -99,7 +184,12 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
     from_number   = body.get("From", "")
     to_number     = body.get("To", "")
 
-    print(f"[twilio] call_sid={call_sid} status={status} duration={duration}s")
+    # UPGRADE #8: tag source — Twilio webhook = inbound or Make.com-triggered.
+    # Make.com passes X-Lead-Source header when it triggers the call;
+    # plain Twilio callbacks won't have it so we default to 'Inbound Call'.
+    source = request.headers.get("X-Lead-Source", "Inbound Call")
+
+    print(f"[twilio] call_sid={call_sid} status={status} duration={duration}s source={source}")
 
     if status != "completed":
         return JSONResponse({"status": "skipped", "reason": f"status={status}"})
@@ -117,6 +207,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         "to_number":     to_number,
         "duration_sec":  duration,
         "recording_url": recording_url,
+        "source":        source,          # UPGRADE #8
         "received_at":   datetime.utcnow().isoformat(),
     }
 
@@ -138,7 +229,7 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
             "?model=nova-3&punctuate=true&diarize=true&smart_format=true&utterances=true",
             headers={
                 "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                "Content-Type": "audio/mp3",
+                "Content-Type":  "audio/mp3",
             },
             content=audio_bytes,
         )
@@ -188,8 +279,7 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
 
 # ── extraction ────────────────────────────────────────────────
 
-# FIX #6: scoring rules restored — without them the LLM has no guidance
-# and produces inconsistent HOT/WARM/COLD classifications.
+# UPGRADE #9: added "name" field to extraction prompt + schema
 EXTRACTION_PROMPT = """
 You are an expert sales analyst at Inbox Infotech.
 Analyze this call transcript and extract structured lead information.
@@ -204,6 +294,7 @@ Transcript:
 
 Return ONLY valid JSON with this exact structure:
 {{
+    "name": "",
     "pain_points": [],
     "budget": "",
     "requirements": [],
@@ -218,6 +309,9 @@ Return ONLY valid JSON with this exact structure:
     "interested_services": []
 }}
 
+Field notes:
+- name: customer's first name if mentioned, else empty string ""
+
 Scoring rules — apply strictly:
 HOT  (score 8-10): clear interest + budget indicator + decision maker + urgency
 WARM (score 4-7) : interested but vague on budget/timeline, or not decision maker
@@ -225,6 +319,7 @@ COLD (score 1-3) : no interest, declined, hung up, wrong number, voicemail
 """
 
 _COLD_FALLBACK: Dict[str, Any] = {
+    "name":               "",
     "pain_points":        [],
     "budget":             "not mentioned",
     "requirements":       [],
@@ -258,6 +353,8 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
 
         extracted = json.loads(response.choices[0].message.content)
 
+        # Defaults + validation
+        extracted.setdefault("name", "")
         extracted.setdefault("pain_points", [])
         extracted.setdefault("requirements", [])
         extracted.setdefault("interested_services", [])
@@ -266,8 +363,11 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
         extracted["lead_score"] = max(1, min(10, int(extracted["lead_score"])))
         cat = extracted["lead_category"].upper()
         extracted["lead_category"] = cat if cat in ("HOT", "WARM", "COLD") else "COLD"
+        # Sanitise name — strip whitespace, never let LLM hallucinate "Unknown"
+        name = str(extracted.get("name", "")).strip()
+        extracted["name"] = name if name.lower() not in ("", "unknown", "n/a", "none") else ""
 
-        print(f"[extract] {call_sid} → {extracted['lead_category']} score={extracted['lead_score']}")
+        print(f"[extract] {call_sid} → {extracted['lead_category']} score={extracted['lead_score']} name='{extracted['name']}'")
         return extracted
 
     except Exception as e:
@@ -278,7 +378,7 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
 # ── Supabase storage ──────────────────────────────────────────
 
 def _save_record_sync(row: Dict[str, Any]) -> None:
-    _get_supabase().table("calls").upsert(row).execute()   # FIX #5
+    _get_supabase().table("calls").upsert(row).execute()
 
 
 async def save_record(record: Dict[str, Any]) -> None:
@@ -295,6 +395,10 @@ async def save_record(record: Dict[str, Any]) -> None:
         "lead_score":    extracted.get("lead_score", 1),
         "extracted":     extracted,
         "recording_url": meta.get("recording_url", ""),
+        # UPGRADE #8: persist source so dashboard Top Sources chart works
+        "source":        meta.get("source", "Unknown"),
+        # UPGRADE #9: top-level name column for fast queries / display
+        "name":          extracted.get("name", ""),
     }
 
     try:
@@ -304,12 +408,9 @@ async def save_record(record: Dict[str, Any]) -> None:
         print(f"[storage] Supabase error: {e}")
 
 
-def _load_records_sync(
-    category: Optional[str],
-    limit: int,
-) -> List[Dict[str, Any]]:
+def _load_records_sync(category: Optional[str], limit: int) -> List[Dict[str, Any]]:
     query = (
-        _get_supabase()                              # FIX #5
+        _get_supabase()
         .table("calls")
         .select("*")
         .order("created_at", desc=True)
@@ -322,7 +423,7 @@ def _load_records_sync(
 
 def _load_stats_sync() -> List[Dict[str, Any]]:
     return (
-        _get_supabase()                              # FIX #5
+        _get_supabase()
         .table("calls")
         .select("lead_category, lead_score")
         .execute()
@@ -332,7 +433,7 @@ def _load_stats_sync() -> List[Dict[str, Any]]:
 
 def _load_transcript_sync(call_sid: str) -> Optional[Dict[str, Any]]:
     res = (
-        _get_supabase()                              # FIX #5
+        _get_supabase()
         .table("calls")
         .select("call_sid, transcript")
         .eq("call_sid", call_sid)
@@ -343,7 +444,6 @@ def _load_transcript_sync(call_sid: str) -> Optional[Dict[str, Any]]:
 
 
 # ── Make.com HOT lead trigger ─────────────────────────────────
-# FIX #2 + #7: function was deleted in team version; restored in full.
 
 async def trigger_hot_lead_workflow(
     call_sid:  str,
@@ -357,8 +457,10 @@ async def trigger_hot_lead_workflow(
     payload = {
         "call_sid":            call_sid,
         "to_number":           meta.get("to_number"),
+        "name":                extracted.get("name", ""),   # UPGRADE #9
         "duration_sec":        meta.get("duration_sec"),
         "recording_url":       meta.get("recording_url"),
+        "source":              meta.get("source", "Unknown"),  # UPGRADE #8
         "lead_category":       extracted.get("lead_category"),
         "lead_score":          extracted.get("lead_score"),
         "intent_level":        extracted.get("intent_level"),
@@ -382,9 +484,9 @@ async def trigger_hot_lead_workflow(
 # ── pipeline ──────────────────────────────────────────────────
 
 async def process_recording_pipeline(
-    call_sid:     str,
+    call_sid:      str,
     recording_url: str,
-    call_meta:    Dict[str, Any],
+    call_meta:     Dict[str, Any],
 ) -> None:
     print(f"[pipeline] started {call_sid}")
 
@@ -408,7 +510,6 @@ async def process_recording_pipeline(
         "extracted":  extracted,
     })
 
-    # FIX #7: was missing — HOT leads never triggered Make.com
     if extracted.get("lead_category") == "HOT":
         print(f"[pipeline] HOT lead — triggering Make.com")
         await trigger_hot_lead_workflow(call_sid, extracted, call_meta)
@@ -417,7 +518,6 @@ async def process_recording_pipeline(
 
 
 # ── GET /api/leads ────────────────────────────────────────────
-# FIX #3: endpoint was deleted in team version; restored.
 
 @app.get("/api/leads")
 async def get_leads(category: Optional[str] = None, limit: int = 100):
@@ -432,6 +532,8 @@ async def get_leads(category: Optional[str] = None, limit: int = 100):
             "timestamp":           r.get("created_at"),
             "from_number":         r.get("from_number"),
             "to_number":           r.get("to_number"),
+            "name":                r.get("name", ""),                          # UPGRADE #9
+            "source":              r.get("source", "Unknown"),                 # UPGRADE #8
             "duration_sec":        r.get("duration_sec"),
             "lead_category":       r.get("lead_category", "COLD"),
             "lead_score":          r.get("lead_score", 1),
@@ -449,7 +551,6 @@ async def get_leads(category: Optional[str] = None, limit: int = 100):
 
 
 # ── GET /api/stats ────────────────────────────────────────────
-# FIX #3: endpoint was deleted in team version; restored.
 
 @app.get("/api/stats")
 async def get_stats():
@@ -462,10 +563,7 @@ async def get_stats():
     hot   = sum(1 for r in rows if r.get("lead_category") == "HOT")
     warm  = sum(1 for r in rows if r.get("lead_category") == "WARM")
     cold  = sum(1 for r in rows if r.get("lead_category") == "COLD")
-
-    avg_score = (
-        sum(r.get("lead_score", 0) for r in rows) / total if total else 0
-    )
+    avg_score = (sum(r.get("lead_score", 0) for r in rows) / total if total else 0)
 
     return JSONResponse({
         "total_calls":     total,
@@ -478,7 +576,6 @@ async def get_stats():
 
 
 # ── GET /api/transcript/{call_sid} ────────────────────────────
-# FIX #3: endpoint was deleted in team version; restored.
 
 @app.get("/api/transcript/{call_sid}")
 async def get_transcript(call_sid: str):
@@ -502,6 +599,30 @@ async def get_transcript(call_sid: str):
     return JSONResponse({"call_sid": call_sid, "transcript": parsed})
 
 
+# ── GET /api/config ───────────────────────────────────────────
+# Exposed so server.py can fetch the prompt via HTTP if preferred
+# (alternative to a shared Supabase client in that process).
+
+@app.get("/api/config")
+async def get_config():
+    cfg = await get_agent_config()
+    # Never expose service role key or internal values — only agent config
+    safe_keys = {
+        "system_prompt", "agent_name", "company_name",
+        "calendly_link", "followup_delay", "notification_email",
+    }
+    return JSONResponse({k: v for k, v in cfg.items() if k in safe_keys})
+
+
+# ── POST /api/config/refresh ──────────────────────────────────
+# server.py calls this to force-bust the cache after a prompt save.
+
+@app.post("/api/config/refresh")
+async def refresh_config():
+    await get_agent_config(force=True)
+    return JSONResponse({"status": "ok", "keys": list(_CONFIG_CACHE.keys())})
+
+
 # ── GET /health ───────────────────────────────────────────────
 
 @app.get("/health")
@@ -514,10 +635,13 @@ async def health():
     except Exception:
         count = -1
 
+    cfg = await get_agent_config()
+
     return JSONResponse({
-        "status":       "ok",
-        "calls_stored": count,
-        "timestamp":    datetime.utcnow().isoformat(),
+        "status":             "ok",
+        "calls_stored":       count,
+        "config_keys_loaded": list(cfg.keys()),
+        "timestamp":          datetime.utcnow().isoformat(),
     })
 
 

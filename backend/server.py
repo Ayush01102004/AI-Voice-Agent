@@ -10,20 +10,23 @@ Endpoints:
   GET  /ws/twilio      — Twilio Media Streams WebSocket
   GET  /health         — Health check
 
-Fixes vs original:
+Upgrades vs previous version:
   1. socket._send(SETTINGS) → socket.send_settings(SETTINGS)          [private API removed]
   2. end_conversation now closes WS so Twilio hangs up                 [call termination fixed]
   3. _cleanup() awaits listener cancel before _cm.__exit__             [race condition fixed]
   4. DeepgramClient created once globally, not per call                [resource leak fixed]
   5. sessions stores call_sid for correlation                          [observability fix]
   6. SETTINGS sent via proper SDK method, not raw dict                 [type safety fix]
+  7. system_prompt fetched from call_handler /api/config per call      [no more hardcoded prompt]
+     — falls back to _DEFAULT_SYSTEM_PROMPT if call_handler unreachable
+  8. CALL_HANDLER_URL env var wires server.py → call_handler.py        [config]
 """
 
 import asyncio
 import base64
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import aiohttp
 from aiohttp import web
@@ -39,16 +42,18 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 if not DEEPGRAM_API_KEY:
     raise ValueError("DEEPGRAM_API_KEY not found in .env")
 
+# UPGRADE #8: URL of the call_handler FastAPI service.
+# Same machine: http://localhost:8000
+# Docker / Railway: set CALL_HANDLER_URL in env.
+CALL_HANDLER_URL = os.getenv("CALL_HANDLER_URL", "http://localhost:8000").rstrip("/")
+
 PORT = 5002
 
 # ── global Deepgram client (created once, reused per call) ────
-# FIX #4: was re-instantiated inside the "start" event handler every call.
-
 deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
 
-# ── config ────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """
+# ── UPGRADE #7: fallback prompt used only when call_handler is unreachable ──
+_DEFAULT_SYSTEM_PROMPT = """
 You are a friendly and confident sales caller from Inbox Infotech.
 You are speaking naturally on a real-time phone call.
 
@@ -68,7 +73,65 @@ SERVICES:
 
 GOAL:
 Understand customer needs and guide the conversation naturally.
-"""
+""".strip()
+
+_DEFAULT_AGENT_NAME = "Inbox Infotech's AI assistant"
+
+# ── UPGRADE #7: fetch prompt from call_handler ────────────────
+
+async def fetch_agent_config() -> Dict[str, str]:
+    """
+    GET {CALL_HANDLER_URL}/api/config → { system_prompt, agent_name, … }
+    Returns defaults on any failure so the call still connects.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{CALL_HANDLER_URL}/api/config",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    print(f"[config] fetched from call_handler — keys: {list(data.keys())}")
+                    return data
+                else:
+                    print(f"[config] call_handler returned {resp.status} — using defaults")
+    except Exception as e:
+        print(f"[config] could not reach call_handler ({e}) — using defaults")
+    return {}
+
+
+def build_settings(system_prompt: str, agent_name: str) -> Dict:
+    """
+    Build the Deepgram SETTINGS dict with the live prompt.
+    Kept as a function so each call gets its own copy — no shared state.
+    """
+    greeting = f"Hello! I am {agent_name}. How can I help you today?"
+
+    return {
+        "type": "Settings",
+        "audio": {
+            "input":  {"encoding": "mulaw", "sample_rate": 8000},
+            "output": {"encoding": "mulaw", "sample_rate": 8000, "container": "none"},
+        },
+        "agent": {
+            "listen": {
+                "provider": {"type": "deepgram", "model": "nova-3"}
+            },
+            "think": {
+                "provider":  {"type": "open_ai", "model": "gpt-4o-mini"},
+                "prompt":    system_prompt,
+                "functions": FUNCTIONS,
+            },
+            "speak": {
+                "provider": {"type": "deepgram", "model": "aura-2-helena-en"}
+            },
+            "greeting": greeting,
+        },
+    }
+
+
+# ── functions (static — not prompt-dependent) ─────────────────
 
 FUNCTIONS = [
     {
@@ -84,35 +147,8 @@ FUNCTIONS = [
     }
 ]
 
-# FIX #6: SETTINGS is kept as a plain dict only for reference.
-# It is passed to send_settings() which accepts a dict — the SDK
-# serialises it internally. Do NOT call socket._send(SETTINGS).
-
-SETTINGS = {
-    "type": "Settings",
-    "audio": {
-        "input":  {"encoding": "mulaw", "sample_rate": 8000},
-        "output": {"encoding": "mulaw", "sample_rate": 8000, "container": "none"},
-    },
-    "agent": {
-        "listen": {
-            "provider": {"type": "deepgram", "model": "nova-3"}
-        },
-        "think": {
-            "provider": {"type": "open_ai", "model": "gpt-4o-mini"},
-            "prompt": SYSTEM_PROMPT,
-            "functions": FUNCTIONS,
-        },
-        "speak": {
-            "provider": {"type": "deepgram", "model": "aura-2-helena-en"}
-        },
-        "greeting": "Hello! I am Inbox Infotech's AI assistant. How can I help you today?",
-    },
-}
-
 # ── active sessions ───────────────────────────────────────────
-# FIX #5: now stores call_sid for log correlation and future per-call ops.
-# Structure: ws → {agent_conn, listener, _cm, stream_sid, call_sid}
+# ws → { agent_conn, listener, _cm, stream_sid, call_sid }
 
 sessions: Dict[Any, Dict[str, Any]] = {}
 
@@ -149,6 +185,7 @@ def agent_listener_thread(
     loop: asyncio.AbstractEventLoop,
     stream_sid: str,
     call_sid: str,
+    settings: Dict,           # UPGRADE #7: per-call settings passed in
 ) -> None:
     try:
         for msg in socket:
@@ -164,9 +201,8 @@ def agent_listener_thread(
             if t == "Welcome":
                 print(f"[agent][{call_sid}] connected → sending settings")
                 try:
-                    # FIX #1: was socket._send(SETTINGS) — private method.
-                    # send_settings() is the public SDK API.
-                    socket.send_settings(SETTINGS)
+                    # UPGRADE #7: use per-call settings (live prompt from DB)
+                    socket.send_settings(settings)
                 except Exception as e:
                     print(f"[settings error][{call_sid}] {e}")
 
@@ -190,7 +226,6 @@ def agent_listener_thread(
                             "message": "Thank you for your time. Have a great day!",
                             "reason":  args.get("reason", ""),
                         }
-                        # Send goodbye response to agent first
                         try:
                             socket.send_function_call_response(
                                 AgentV1SendFunctionCallResponse(
@@ -200,9 +235,6 @@ def agent_listener_thread(
                         except Exception as e:
                             print(f"[fn response][{call_sid}] {e}")
 
-                        # FIX #2: was missing — WS was never closed so Twilio
-                        # kept the call alive. Schedule WS close on the event loop
-                        # so Twilio receives a clean disconnect and hangs up.
                         print(f"[fn][{call_sid}] closing call after end_conversation")
                         asyncio.run_coroutine_threadsafe(ws.close(), loop)
 
@@ -242,9 +274,6 @@ async def _cleanup(ws: web.WebSocketResponse) -> None:
     s = sessions.pop(ws, {})
     call_sid = s.get("call_sid", "?")
 
-    # FIX #3: was cancel() without await — _cm.__exit__ could run while
-    # listener thread was still writing to socket, causing silent errors.
-    # Now: cancel + await before closing the Deepgram context manager.
     listener = s.get("listener")
     if listener:
         listener.cancel()
@@ -284,7 +313,10 @@ async def twilio_ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(max_msg_size=0)
     await ws.prepare(request)
 
-    sessions[ws] = {"agent_conn": None, "listener": None, "_cm": None, "stream_sid": "", "call_sid": ""}
+    sessions[ws] = {
+        "agent_conn": None, "listener": None, "_cm": None,
+        "stream_sid": "", "call_sid": "",
+    }
     print("[twilio] websocket connected")
 
     try:
@@ -301,19 +333,28 @@ async def twilio_ws_handler(request: web.Request) -> web.WebSocketResponse:
                         stream_sid = data.get("streamSid", "")
                         call_sid   = data.get("start", {}).get("callSid", stream_sid)
                         sessions[ws]["stream_sid"] = stream_sid
-                        sessions[ws]["call_sid"]   = call_sid          # FIX #5
+                        sessions[ws]["call_sid"]   = call_sid
                         print(f"[twilio] call started — call_sid={call_sid}")
 
+                        # UPGRADE #7: fetch live prompt from call_handler
+                        cfg = await fetch_agent_config()
+                        system_prompt = cfg.get("system_prompt", "").strip() or _DEFAULT_SYSTEM_PROMPT
+                        agent_name    = cfg.get("agent_name", "").strip()    or _DEFAULT_AGENT_NAME
+                        settings      = build_settings(system_prompt, agent_name)
+                        prompt_preview = system_prompt[:60].replace("\n", " ")
+                        print(f"[twilio][{call_sid}] prompt: '{prompt_preview}…'")
+
                         loop   = asyncio.get_running_loop()
-                        # FIX #4: use global deepgram_client, not new instance per call
                         cm     = deepgram_client.agent.v1.connect()
                         socket = await asyncio.to_thread(cm.__enter__)
 
-                        sessions[ws]["_cm"]       = cm
-                        sessions[ws]["agent_conn"] = socket
-                        sessions[ws]["listener"]   = asyncio.ensure_future(
+                        sessions[ws]["_cm"]        = cm
+                        sessions[ws]["agent_conn"]  = socket
+                        sessions[ws]["listener"]    = asyncio.ensure_future(
                             asyncio.to_thread(
-                                agent_listener_thread, socket, ws, loop, stream_sid, call_sid
+                                agent_listener_thread,
+                                socket, ws, loop, stream_sid, call_sid,
+                                settings,   # UPGRADE #7: pass per-call settings
                             )
                         )
 
@@ -349,8 +390,15 @@ async def twilio_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
 
 async def health(request: web.Request) -> web.Response:
+    cfg = await fetch_agent_config()
     return web.Response(
-        text=json.dumps({"status": "ok", "active_sessions": len(sessions)}),
+        text=json.dumps({
+            "status":          "ok",
+            "active_sessions": len(sessions),
+            "call_handler":    CALL_HANDLER_URL,
+            "prompt_loaded":   bool(cfg.get("system_prompt")),
+            "agent_name":      cfg.get("agent_name", _DEFAULT_AGENT_NAME),
+        }),
         content_type="application/json",
     )
 
@@ -372,6 +420,7 @@ async def main() -> None:
     print(f"  POST /twilio/voice → TwiML webhook")
     print(f"  GET  /ws/twilio    → Media Streams")
     print(f"  GET  /health       → health check")
+    print(f"  call_handler       → {CALL_HANDLER_URL}")
     print(f"  Ctrl+C to stop\n")
 
     await asyncio.Future()
