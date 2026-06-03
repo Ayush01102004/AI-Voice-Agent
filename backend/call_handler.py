@@ -35,8 +35,8 @@ from supabase import create_client, Client
 load_dotenv()
 
 DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
-GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
-MAKE_HOT_LEAD_WEBHOOK = os.getenv("MAKE_HOT_LEAD_WEBHOOK", "")
+GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "") 
+N8N_WEBHOOK_URL       = os.getenv("N8N_WEBHOOK_URL", "")
 SUPABASE_URL          = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
@@ -185,7 +185,7 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
     to_number     = body.get("To", "")
 
     # UPGRADE #8: tag source — Twilio webhook = inbound or Make.com-triggered.
-    # Make.com passes X-Lead-Source header when it triggers the call;
+    # N8N passes X-leads-source header when it triggers the call;
     # plain Twilio callbacks won't have it so we default to 'Inbound Call'.
     source = request.headers.get("X-Lead-Source", "Inbound Call")
 
@@ -450,8 +450,8 @@ async def trigger_hot_lead_workflow(
     extracted: Dict[str, Any],
     meta:      Dict[str, Any],
 ) -> None:
-    if not MAKE_HOT_LEAD_WEBHOOK:
-        print("[make] webhook not configured — skipping")
+    if not N8N_WEBHOOK_URL:
+        print("[n8n] webhook not configured — skipping")
         return
 
     payload = {
@@ -475,10 +475,10 @@ async def trigger_hot_lead_workflow(
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(MAKE_HOT_LEAD_WEBHOOK, json=payload)
-        print(f"[make] {resp.status_code} for {call_sid}")
+            resp = await client.post(N8N_WEBHOOK_URL, json=payload)
+        print(f"[n8n] {resp.status_code} for {call_sid}")
     except Exception as e:
-        print(f"[make] failed: {e}")
+        print(f"[n8n] failed: {e}")
 
 
 # ── pipeline ──────────────────────────────────────────────────
@@ -511,7 +511,7 @@ async def process_recording_pipeline(
     })
 
     if extracted.get("lead_category") == "HOT":
-        print(f"[pipeline] HOT lead — triggering Make.com")
+        print(f"[pipeline] HOT lead — triggering n8n")
         await trigger_hot_lead_workflow(call_sid, extracted, call_meta)
 
     print(f"[pipeline] completed {call_sid}")

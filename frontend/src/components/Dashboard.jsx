@@ -1,5 +1,6 @@
 // src/components/Dashboard.jsx
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import PageSettings from './PageSettings'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react'
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
+const GOOGLE_FORM_URL = 'https://docs.google.com/forms/d/e/1FAIpQLSdSOD2Wrt-Nfk-6YrzUjIO9HyCRRCFzHz8a5uku43Z4fhhaHA/viewform?usp=dialog'
 
 // ── DB adapter ────────────────────────────────────────────────
 function normalizeRow(row) {
@@ -383,7 +385,6 @@ function PageDashboard({ records, stats, loading, filter, setFilter, openTranscr
                   <td style={{ color: 'var(--text2)', fontSize: 12 }}>{r.last_contacted_at ? fmtDateTime(r.last_contacted_at) : fmtDateTime(r.timestamp)}</td>
                   <td>
                     <div className={styles.actions}>
-                      <button className={styles.iconBtn} title="View transcript" onClick={() => openTranscript(r.call_sid)}><Eye size={14} /></button>
                       <button className={styles.iconBtn} title={`Call ${r.to_number}`} onClick={() => window.open(`tel:${r.to_number}`)}><PhoneCall size={14} /></button>
                       <button className={styles.iconBtn} title="Copy number" onClick={() => { navigator.clipboard.writeText(r.to_number || ''); showToast(`Copied ${r.to_number}`) }}><Copy size={14} /></button>
                     </div>
@@ -561,7 +562,6 @@ function PageLeads({ records, loading, openTranscript, showToast, fetchAll, agen
                     <td style={{ color: 'var(--text2)', whiteSpace: 'nowrap' }}>{fmtDate(r.timestamp)}</td>
                     <td onClick={e => e.stopPropagation()}>
                       <div className={styles.actions}>
-                        <button className={styles.iconBtn} onClick={() => openTranscript(r.call_sid)}><Eye size={14} /></button>
                         <button className={styles.iconBtn} title={`Call ${r.to_number}`} onClick={e => { e.stopPropagation(); window.open(`tel:${r.to_number}`) }}><PhoneCall size={14} /></button>
                         <button className={styles.iconBtn} title="Copy number" onClick={e => { e.stopPropagation(); navigator.clipboard.writeText(r.to_number || ''); showToast(`Copied ${r.to_number}`) }}><Copy size={14} /></button>
                       </div>
@@ -826,105 +826,506 @@ function PageConversations({ records, loading, openTranscript, globalSearch }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// PAGE: FORMS
+// PAGE: FORMS  —  fully refactored
 // ══════════════════════════════════════════════════════════════
-function PageForms({ showToast, globalSearch, setFormCount }) {
-  const [submissions, setSubmissions] = useState([])
-  const [loading,     setLoading]     = useState(true)
-  // FIX: added error state — was silently failing on 400/RLS errors
-  const [fetchError,  setFetchError]  = useState(null)
+
+// ── helpers ──────────────────────────────────────────────────
+const inputStyle = {
+  width: '100%', padding: '9px 12px', borderRadius: 8,
+  border: '0.5px solid var(--border2)', background: 'var(--bg3)',
+  color: 'var(--text1)', fontSize: 13, boxSizing: 'border-box',
+  outline: 'none'
+}
+const labelStyle = { fontSize: 11, color: 'var(--text2)', marginBottom: 4, display: 'block' }
+
+async function sendFormEmail(email, name, formUrl) {
+  const { data, error } = await supabase.functions.invoke('send-form-email', {
+    body: { email, name, formUrl }
+  })
+  if (error) throw new Error(error.message)
+  if (data?.error) throw new Error(data.error)
+  return data
+}
+
+// ── FormSetupModal ────────────────────────────────────────────
+function FormSetupModal({ onClose, onSave, showToast }) {
+  const [gmailHint, setGmailHint] = useState(localStorage.getItem('form_gmail') || '')
+  const [formUrl,   setFormUrl]   = useState(localStorage.getItem('google_form_url') || '')
+  const [saved,     setSaved]     = useState(() => JSON.parse(localStorage.getItem('saved_forms') || '[]'))
+
+  function handleSave() {
+    if (!formUrl.includes('docs.google.com/forms')) {
+      showToast('Paste a valid Google Form URL'); return
+    }
+    localStorage.setItem('google_form_url', formUrl)
+    localStorage.setItem('form_gmail', gmailHint)
+    const existing = JSON.parse(localStorage.getItem('saved_forms') || '[]')
+    if (!existing.find(f => f.url === formUrl)) {
+      existing.unshift({ url: formUrl, label: `Form ${existing.length + 1}`, gmail: gmailHint, addedAt: new Date().toISOString() })
+      localStorage.setItem('saved_forms', JSON.stringify(existing))
+    }
+    onSave(formUrl)
+    showToast('Form URL saved!')
+    onClose()
+  }
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ background:'var(--bg2)', border:'0.5px solid var(--border2)', borderRadius:12, padding:28, width:440, display:'flex', flexDirection:'column', gap:16 }}>
+        <h3 style={{ margin:0, fontSize:15, color:'var(--text1)' }}>Google Form Setup</h3>
+
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={labelStyle}>Sender Gmail (saved for next time)</label>
+          <input value={gmailHint} onChange={e => setGmailHint(e.target.value)}
+            placeholder="yourname@gmail.com" style={inputStyle} />
+        </div>
+
+        <button onClick={() => window.open('https://docs.google.com/forms/create', '_blank')}
+          style={{ padding:'9px 14px', borderRadius:8, border:'0.5px solid var(--border2)',
+            background:'var(--bg3)', color:'var(--text1)', fontSize:13, cursor:'pointer',
+            display:'flex', alignItems:'center', gap:8 }}>
+          ➕ Create New Google Form
+          <span style={{ fontSize:11, color:'var(--text3)' }}>(opens in new tab)</span>
+        </button>
+
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={labelStyle}>Paste Form Share URL *</label>
+          <input value={formUrl} onChange={e => setFormUrl(e.target.value)}
+            placeholder="https://docs.google.com/forms/d/e/..." style={inputStyle} />
+          <span style={{ fontSize:10, color:'var(--text3)' }}>Google Forms → Share → Copy link → paste here</span>
+        </div>
+
+        {saved.length > 0 && (
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            <label style={labelStyle}>Previously saved forms</label>
+            <div style={{ maxHeight:120, overflowY:'auto', display:'flex', flexDirection:'column', gap:4 }}>
+              {saved.map((f, i) => (
+                <div key={i} onClick={() => setFormUrl(f.url)}
+                  style={{ padding:'6px 10px', borderRadius:7, border:'0.5px solid var(--border2)',
+                    background: formUrl === f.url ? 'var(--accent)' : 'var(--bg3)',
+                    color: formUrl === f.url ? '#fff' : 'var(--text1)',
+                    fontSize:12, cursor:'pointer', display:'flex', justifyContent:'space-between' }}>
+                  <span>{f.label}{f.gmail ? ` · ${f.gmail}` : ''}</span>
+                  <span style={{ fontSize:10, opacity:0.6 }}>{fmtDate(f.addedAt)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
+          <button onClick={onClose}
+            style={{ padding:'7px 16px', borderRadius:8, border:'0.5px solid var(--border2)',
+              background:'var(--bg3)', color:'var(--text2)', fontSize:13, cursor:'pointer' }}>
+            Cancel
+          </button>
+          <button onClick={handleSave} disabled={!formUrl}
+            style={{ padding:'7px 16px', borderRadius:8, border:'none',
+              background:'var(--accent)', color:'#fff', fontSize:13, cursor:'pointer', opacity: !formUrl ? 0.5 : 1 }}>
+            Save & Use
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── FormLibraryModal ──────────────────────────────────────────
+function FormLibraryModal({ onClose, onUse, showToast }) {
+  const [forms, setForms] = useState(() => JSON.parse(localStorage.getItem('saved_forms') || '[]'))
+
+  function deleteForm(url) {
+    const updated = forms.filter(f => f.url !== url)
+    setForms(updated)
+    localStorage.setItem('saved_forms', JSON.stringify(updated))
+    showToast('Form removed')
+  }
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.6)', zIndex:1000, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ background:'var(--bg2)', border:'0.5px solid var(--border2)', borderRadius:12, padding:28, width:520, display:'flex', flexDirection:'column', gap:16, maxHeight:'80vh' }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+          <h3 style={{ margin:0, fontSize:15, color:'var(--text1)' }}>Forms Library</h3>
+          <button onClick={onClose}
+            style={{ padding:'4px 12px', borderRadius:7, border:'0.5px solid var(--border2)',
+              background:'var(--bg3)', color:'var(--text2)', fontSize:12, cursor:'pointer' }}>
+            Close
+          </button>
+        </div>
+
+        {forms.length === 0 ? (
+          <div style={{ textAlign:'center', padding:'32px 0', color:'var(--text3)', fontSize:13 }}>
+            No saved forms. Use ⚙️ Setup Form to add one.
+          </div>
+        ) : (
+          <div style={{ overflowY:'auto', display:'flex', flexDirection:'column', gap:10 }}>
+            {forms.map((f, i) => (
+              <div key={i} style={{ background:'var(--bg3)', border:'0.5px solid var(--border2)',
+                borderRadius:10, padding:'14px 16px', display:'flex', flexDirection:'column', gap:8 }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+                  <div>
+                    <div style={{ fontWeight:600, fontSize:13, color:'var(--text1)' }}>{f.label}</div>
+                    {f.gmail && <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{f.gmail}</div>}
+                    <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{fmtDate(f.addedAt)}</div>
+                  </div>
+                </div>
+                <div style={{ fontSize:11, color:'var(--text3)', wordBreak:'break-all' }}>{f.url}</div>
+                <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                  <button onClick={() => window.open(f.url, '_blank')}
+                    style={{ padding:'5px 12px', borderRadius:7, border:'0.5px solid var(--border2)',
+                      background:'var(--bg2)', color:'var(--text1)', fontSize:12, cursor:'pointer' }}>
+                    🔗 Open
+                  </button>
+                  <button onClick={() => { onUse(f.url); showToast(`Now using: ${f.label}`); onClose() }}
+                    style={{ padding:'5px 12px', borderRadius:7, border:'none',
+                      background:'var(--accent)', color:'#fff', fontSize:12, cursor:'pointer' }}>
+                    ✓ Use Form
+                  </button>
+                  <button onClick={() => { navigator.clipboard.writeText(f.url); showToast('URL copied') }}
+                    style={{ padding:'5px 12px', borderRadius:7, border:'0.5px solid var(--border2)',
+                      background:'var(--bg2)', color:'var(--text2)', fontSize:12, cursor:'pointer' }}>
+                    <Copy size={12}/>
+                  </button>
+                  <button onClick={() => deleteForm(f.url)}
+                    style={{ padding:'5px 12px', borderRadius:7, border:'0.5px solid rgba(239,68,68,0.3)',
+                      background:'rgba(239,68,68,0.08)', color:'#ef4444', fontSize:12, cursor:'pointer' }}>
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── SendFormModal ─────────────────────────────────────────────
+function SendFormModal({ onClose, onSent, showToast, formUrl }) {
+  const [name,      setName]      = useState('')
+  const [leadEmail, setLeadEmail] = useState('')
+  const [rep,       setRep]       = useState(localStorage.getItem('form_rep') || '')
+  const [busy,      setBusy]      = useState(false)
+  const [sent,      setSent]      = useState(false)
+
+  function isValidEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) }
+
+  async function handleSend() {
+    if (!leadEmail.trim())        { showToast('Email is required'); return }
+    if (!isValidEmail(leadEmail)) { showToast('Enter a valid email address'); return }
+    if (!formUrl)                 { showToast('No form URL — click ⚙️ Setup Form'); return }
+
+    setBusy(true)
+    try {
+      // log first
+      const { error: logErr } = await supabase.from('form_send_log').insert({
+        lead_name: name, lead_email: leadEmail, sent_by: rep, form_url: formUrl
+      })
+      if (logErr) { showToast('Log error: ' + logErr.message); return }
+
+      // send via edge fn
+      await sendFormEmail(leadEmail, name, formUrl)
+
+      localStorage.setItem('form_rep', rep)
+      setSent(true)
+      showToast(`Email sent to ${leadEmail}`)
+      setTimeout(() => { onSent(); onClose() }, 1000)
+
+    } catch (err) {
+      showToast('Send failed: ' + err.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', zIndex:999, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ background:'var(--bg2)', border:'0.5px solid var(--border2)', borderRadius:12, padding:28, width:520, display:'flex', flexDirection:'column', gap:18 }}>
+        <h3 style={{ margin:0, fontSize:15, color:'var(--text1)' }}>Send Form via Email</h3>
+
+        {!formUrl && (
+          <div style={{ padding:'10px 14px', borderRadius:8, background:'rgba(239,68,68,0.1)',
+            border:'0.5px solid rgba(239,68,68,0.3)', color:'#ef4444', fontSize:12 }}>
+            ⚠️ No form URL configured. Close and click ⚙️ Setup Form first.
+          </div>
+        )}
+
+        {[
+          { label:'Lead Email *', val:leadEmail, set:setLeadEmail, ph:'lead@example.com', type:'email' },
+          { label:'Lead Name',    val:name,      set:setName,      ph:'Full name',        type:'text'  },
+          { label:'Sent By',      val:rep,       set:setRep,       ph:'Sales rep name',   type:'text'  },
+        ].map(({ label, val, set, ph, type }) => (
+          <div key={label} style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            <label style={labelStyle}>{label}</label>
+            <input type={type} value={val} onChange={e => set(e.target.value)}
+              placeholder={ph} style={inputStyle} />
+          </div>
+        ))}
+
+        <div style={{ display:'flex', gap:8, justifyContent:'flex-end', paddingTop:4 }}>
+          <button onClick={onClose}
+            style={{ padding:'8px 18px', borderRadius:8, border:'0.5px solid var(--border2)',
+              background:'var(--bg3)', color:'var(--text2)', fontSize:13, cursor:'pointer' }}>
+            Cancel
+          </button>
+          <button onClick={handleSend} disabled={busy || !leadEmail || !formUrl}
+            style={{ padding:'8px 20px', borderRadius:8, border:'none',
+              background: sent ? '#22c55e' : 'var(--accent)', color:'#fff', fontSize:13,
+              cursor:'pointer', display:'flex', alignItems:'center', gap:6,
+              opacity:(busy || !leadEmail || !formUrl) ? 0.5 : 1, minWidth:120, justifyContent:'center' }}>
+            {sent ? '✓ Sent!' : busy ? 'Sending…' : '📧 Send Email'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── SendLogTab ────────────────────────────────────────────────
+function SendLogTab({ showToast, formUrl }) {
+  const [log,     setLog]     = useState([])
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    setLoading(true)
-    setFetchError(null)
+    supabase.from('form_send_log')
+      .select('*')
+      .order('sent_at', { ascending: false })
+      .limit(200)
+      .then(({ data }) => { setLog(data || []); setLoading(false) })
+  }, [])
+
+  async function handleResend(l) {
+    const url = l.form_url || formUrl
+    if (!url) { showToast('No form URL available'); return }
+    try {
+      await sendFormEmail(l.lead_email, l.lead_name, url)
+      showToast(`Reminder email sent to ${l.lead_email}`)
+    } catch (err) {
+      showToast('Resend failed: ' + err.message)
+    }
+  }
+
+  return (
+    <div className={styles.tableCard}>
+      <div className={styles.tableWrap}>
+        <table className={styles.table}>
+          <thead>
+            <tr>
+              <th>Lead Name</th><th>Email</th><th>Sent By</th>
+              <th>Sent At</th><th>Status</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading ? (
+              <tr><td colSpan={6} className={styles.emptyRow}>Loading…</td></tr>
+            ) : log.length === 0 ? (
+              <tr><td colSpan={6}><VisualEmptyState message="No forms sent yet" /></td></tr>
+            ) : log.map(l => (
+              <tr key={l.id} className={styles.tableRow}>
+                <td style={{ fontWeight:500 }}>{l.lead_name || '—'}</td>
+                <td style={{ fontSize:12, color:'var(--text2)' }}>{l.lead_email}</td>
+                <td style={{ color:'var(--text2)' }}>{l.sent_by || '—'}</td>
+                <td style={{ color:'var(--text2)', whiteSpace:'nowrap' }}>{fmtDate(l.sent_at)}</td>
+                <td>
+                  {l.response_received
+                    ? <span style={{ display:'flex', alignItems:'center', gap:4, color:'#22c55e', fontSize:12 }}><CheckCircle size={13}/> Filled</span>
+                    : <span style={{ display:'flex', alignItems:'center', gap:4, color:'var(--text3)', fontSize:12 }}><Clock size={13}/> Pending</span>
+                  }
+                </td>
+                <td>
+                  <div className={styles.actions}>
+                    <button className={styles.iconBtn} title="Resend Email" onClick={() => handleResend(l)}>
+                      <Send size={14}/>
+                    </button>
+                    <button className={styles.iconBtn} title="Copy Email"
+                      onClick={() => { navigator.clipboard.writeText(l.lead_email); showToast('Email copied') }}>
+                      <Copy size={14}/>
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ── PageForms ─────────────────────────────────────────────────
+function PageForms({ showToast, globalSearch, setFormCount }) {
+  const [submissions,    setSubmissions]    = useState([])
+  const [loading,        setLoading]        = useState(true)
+  const [fetchError,     setFetchError]     = useState(null)
+  const [tab,            setTab]            = useState('responses')
+  const [showModal,      setShowModal]      = useState(false)
+  const [showSetup,      setShowSetup]      = useState(false)
+  const [showLibrary,    setShowLibrary]    = useState(false)
+  const [formUrl,        setFormUrl]        = useState(localStorage.getItem('google_form_url') || '')
+
+  function loadSubmissions() {
+    setLoading(true); setFetchError(null)
     supabase.from('form_submissions')
       .select('*, calls(lead_category, lead_score)')
       .order('submitted_at', { ascending: false })
       .limit(200)
       .then(({ data, error }) => {
-        if (error) {
-          console.error('[PageForms]', error.message)
-          setFetchError(error.message)
-        }
+        if (error) { console.error('[PageForms]', error.message); setFetchError(error.message) }
         const items = data || []
         setSubmissions(items)
         setFormCount(items.length)
         setLoading(false)
       })
-  }, [setFormCount])
+  }
 
-  const filtered = useMemo(() => {
-    return submissions.filter(s =>
-      !globalSearch ||
-      (s.name || '').toLowerCase().includes(globalSearch.toLowerCase()) ||
-      (s.to_number || '').includes(globalSearch) ||
-      (s.email || '').toLowerCase().includes(globalSearch.toLowerCase()) ||
-      (s.service_requirements || '').toLowerCase().includes(globalSearch.toLowerCase())
-    )
-  }, [submissions, globalSearch])
+  useEffect(() => { loadSubmissions() }, [setFormCount])
+
+  const filtered = useMemo(() => submissions.filter(s =>
+    !globalSearch ||
+    (s.name  || '').toLowerCase().includes(globalSearch.toLowerCase()) ||
+    (s.email || '').toLowerCase().includes(globalSearch.toLowerCase()) ||
+    (s.service_requirements || '').toLowerCase().includes(globalSearch.toLowerCase())
+  ), [submissions, globalSearch])
+
+  function handleUseForm(url) {
+    localStorage.setItem('google_form_url', url)
+    setFormUrl(url)
+  }
 
   return (
     <>
+      {showSetup   && <FormSetupModal   onClose={() => setShowSetup(false)}   onSave={handleUseForm} showToast={showToast} />}
+      {showLibrary && <FormLibraryModal onClose={() => setShowLibrary(false)} onUse={handleUseForm}  showToast={showToast} />}
+      {showModal   && <SendFormModal    onClose={() => setShowModal(false)}   onSent={() => {}}      showToast={showToast} formUrl={formUrl} />}
+
       {fetchError && (
-        <div className={styles.errorBanner} style={{ marginBottom: 12 }}>
-          <AlertCircle size={14} />
+        <div className={styles.errorBanner} style={{ marginBottom:12 }}>
+          <AlertCircle size={14}/>
           <span><b>Forms fetch error:</b> {fetchError}</span>
         </div>
       )}
-      <div style={{ display: 'flex', gap: 10, marginBottom: 16, justifyContent: 'flex-end', alignItems: 'center' }}>
-        <span style={{ fontSize: 12, color: 'var(--text2)' }}>{filtered.length} submissions</span>
-        <button onClick={() => { exportCSV(filtered, ['name','to_number','email','service_requirements','budget','timeline','submitted_at'], 'form_submissions'); showToast(`Exported ${filtered.length} form rows`) }}
-          style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 14px', background:'var(--bg3)', border:'0.5px solid var(--border2)', borderRadius:8, color:'var(--text1)', fontSize:12, cursor:'pointer', whiteSpace:'nowrap' }}>
-          <Download size={13}/> Export CSV
-        </button>
-      </div>
-      <div className={styles.tableCard}>
-        <div className={styles.tableWrap}>
-          <table className={styles.table}>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Phone</th>
-                <th>Email</th>
-                <th>Service requirements</th>
-                <th>Budget</th>
-                <th>Timeline</th>
-                <th>Lead status</th>
-                <th>Submitted</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr><td colSpan={9} className={styles.emptyRow}>Loading…</td></tr>
-              ) : filtered.length === 0 ? (
-                <tr><td colSpan={9}><VisualEmptyState message="No form submissions found" /></td></tr>
-              ) : filtered.map(s => (
-                <tr key={s.id} className={styles.tableRow}>
-                  <td style={{ fontWeight: 500 }}>{s.name || '—'}</td>
-                  <td className={styles.mono}>{s.to_number || '—'}</td>
-                  <td style={{ color: 'var(--text2)', fontSize: 12 }}>{s.email || '—'}</td>
-                  <td className={styles.summaryCell}>{s.service_requirements || '—'}</td>
-                  <td style={{ color: 'var(--text2)' }}>{s.budget || '—'}</td>
-                  <td style={{ color: 'var(--text2)' }}>{s.timeline || '—'}</td>
-                  <td>{s.calls ? <Badge category={s.calls.lead_category} /> : <span style={{ color: 'var(--text3)', fontSize: 12 }}>—</span>}</td>
-                  <td style={{ color: 'var(--text2)', whiteSpace: 'nowrap' }}>{fmtDate(s.submitted_at)}</td>
-                  <td>
-                    <div className={styles.actions}>
-                      <button className={styles.iconBtn} title="Copy phone" onClick={() => { navigator.clipboard.writeText(s.to_number || ''); showToast(`Copied ${s.to_number}`) }}><Copy size={14} /></button>
-                      <button className={styles.iconBtn} title="Call" onClick={() => window.open(`tel:${s.to_number}`)}><PhoneCall size={14} /></button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+
+      {/* Toolbar */}
+      <div style={{ display:'flex', gap:10, marginBottom:16, justifyContent:'space-between', alignItems:'center' }}>
+        <div style={{ display:'flex', gap:4 }}>
+          {[{ key:'responses', label:'Responses' }, { key:'sent', label:'Sent Log' }].map(t => (
+            <button key={t.key} onClick={() => setTab(t.key)}
+              style={{ padding:'6px 14px', borderRadius:8, fontSize:12, cursor:'pointer',
+                border:'0.5px solid var(--border2)',
+                background: tab === t.key ? 'var(--accent)' : 'var(--bg3)',
+                color:      tab === t.key ? '#fff'          : 'var(--text2)' }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+          {tab === 'responses' && (
+            <span style={{ fontSize:12, color:'var(--text2)' }}>{filtered.length} submissions</span>
+          )}
+
+          <span style={{ fontSize:11, padding:'3px 8px', borderRadius:6,
+            background: formUrl ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
+            color: formUrl ? '#22c55e' : '#ef4444',
+            border: `0.5px solid ${formUrl ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}` }}>
+            {formUrl ? '✓ Form set' : '⚠ No form'}
+          </span>
+
+          <button onClick={() => setShowSetup(true)}
+            style={{ padding:'6px 14px', borderRadius:8, border:'0.5px solid var(--border2)',
+              background:'var(--bg3)', color:'var(--text1)', fontSize:12, cursor:'pointer' }}>
+            ⚙️ Setup Form
+          </button>
+
+          <button onClick={() => setShowLibrary(true)}
+            style={{ padding:'6px 14px', borderRadius:8, border:'0.5px solid var(--border2)',
+              background:'var(--bg3)', color:'var(--text1)', fontSize:12, cursor:'pointer' }}>
+            📚 Forms Library
+          </button>
+
+          <button onClick={() => setShowModal(true)}
+            style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 14px',
+              background:'var(--accent)', border:'none', borderRadius:8,
+              color:'#fff', fontSize:12, cursor:'pointer' }}>
+            <Send size={13}/> Send Email
+          </button>
+
+          {tab === 'responses' && (
+            <button onClick={() => {
+              exportCSV(filtered, ['name','email','service_requirements','budget','timeline','submitted_at'], 'form_submissions')
+              showToast(`Exported ${filtered.length} rows`)
+            }} style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 14px',
+              background:'var(--bg3)', border:'0.5px solid var(--border2)', borderRadius:8,
+              color:'var(--text1)', fontSize:12, cursor:'pointer' }}>
+              <Download size={13}/> Export CSV
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Tab content */}
+      {tab === 'responses' ? (
+        <div className={styles.tableCard}>
+          <div className={styles.tableWrap}>
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Name</th><th>Email</th><th>Service Requirements</th>
+                  <th>Budget</th><th>Timeline</th><th>Lead Status</th>
+                  <th>Submitted</th><th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading ? (
+                  <tr><td colSpan={8} className={styles.emptyRow}>Loading…</td></tr>
+                ) : filtered.length === 0 ? (
+                  <tr><td colSpan={8}><VisualEmptyState message="No form submissions found" /></td></tr>
+                ) : filtered.map(s => (
+                  <tr key={s.id} className={styles.tableRow}>
+                    <td style={{ fontWeight:500 }}>{s.name || '—'}</td>
+                    <td style={{ color:'var(--text2)', fontSize:12 }}>{s.email || '—'}</td>
+                    <td className={styles.summaryCell}>{s.service_requirements || '—'}</td>
+                    <td style={{ color:'var(--text2)' }}>{s.budget || '—'}</td>
+                    <td style={{ color:'var(--text2)' }}>{s.timeline || '—'}</td>
+                    <td>{s.calls
+                      ? <Badge category={s.calls.lead_category}/>
+                      : <span style={{ color:'var(--text3)', fontSize:12 }}>—</span>}
+                    </td>
+                    <td style={{ color:'var(--text2)', whiteSpace:'nowrap' }}>{fmtDate(s.submitted_at)}</td>
+                    <td>
+                      <div className={styles.actions}>
+                        <button className={styles.iconBtn} title="Copy Email"
+                          onClick={() => { navigator.clipboard.writeText(s.email || ''); showToast('Email copied') }}>
+                          <Copy size={14}/>
+                        </button>
+                        <button className={styles.iconBtn} title="Send Form Email"
+                          onClick={async () => {
+                            if (!formUrl) { showToast('No form URL configured'); return }
+                            if (!s.email) { showToast('No email for this lead'); return }
+                            try {
+                              await sendFormEmail(s.email, s.name, formUrl)
+                              showToast(`Form sent to ${s.email}`)
+                            } catch (err) {
+                              showToast('Send failed: ' + err.message)
+                            }
+                          }}>
+                          <Send size={14}/>
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <SendLogTab showToast={showToast} formUrl={formUrl}/>
+      )}
     </>
   )
 }
-
 // ══════════════════════════════════════════════════════════════
 // PAGE: ANALYTICS
 // ══════════════════════════════════════════════════════════════
@@ -1163,7 +1564,7 @@ function PagePrompt({ showToast }) {
   }
 
   // ────────────────────────────────────────────────────────────
-  // REAL ROLLBACK
+  //ROLLBACK
   // ────────────────────────────────────────────────────────────
   async function rollbackPrompt(oldPrompt) {
     try {
@@ -1509,82 +1910,6 @@ function PagePrompt({ showToast }) {
     </div>
   )
 }
-
-
-
-// ══════════════════════════════════════════════════════════════
-// PAGE: SETTINGS
-// ══════════════════════════════════════════════════════════════
-const SETTINGS_FIELDS = [
-  { key: 'agent_name',          label: 'Agent name',            placeholder: 'Alex',                           type: 'text'   },
-  { key: 'company_name',        label: 'Company name',          placeholder: 'Inbox Infotech',                 type: 'text'   },
-  { key: 'calendly_link',       label: 'Calendly link',         placeholder: 'https://calendly.com/your-link', type: 'url'    },
-  { key: 'followup_delay',      label: 'Follow-up delay (hrs)', placeholder: '24',                             type: 'number' },
-  { key: 'notification_email',  label: 'Notification email',    placeholder: 'sales@yourcompany.com',          type: 'email'  },
-]
-
-function PageSettings({ showToast, onConfigChange }) {
-  const [values,  setValues]  = useState({})
-  const [loading, setLoading] = useState(true)
-  const [saving,  setSaving]  = useState(false)
-
-  useEffect(() => {
-    supabase.from('agent_config').select('key, value')
-      .in('key', SETTINGS_FIELDS.map(f => f.key))
-      .then(({ data, error }) => {
-        // FIX: was silently swallowing error
-        if (error) console.error('[PageSettings load]', error.message)
-        const map = {}
-        ;(data || []).forEach(r => { map[r.key] = r.value })
-        setValues(map)
-        setLoading(false)
-      })
-  }, [])
-
-  async function save() {
-    setSaving(true)
-    const upserts = SETTINGS_FIELDS.map(f => ({
-      key: f.key,
-      value: values[f.key] || '',
-      updated_at: new Date().toISOString(),
-    }))
-    const { error } = await supabase.from('agent_config').upsert(upserts, { onConflict: 'key' })
-    setSaving(false)
-    if (error) { showToast('Error saving settings', 'err'); return }
-    showToast('Settings saved ✓')
-    onConfigChange(values)
-  }
-
-  if (loading) return <p style={{ color: 'var(--text2)', padding: '2rem', textAlign: 'center' }}>Loading config…</p>
-
-  return (
-    <div style={{ maxWidth: 560 }}>
-      <div style={{ background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 14, padding: '1.5rem' }}>
-        <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 20 }}>Agent configuration</h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {SETTINGS_FIELDS.map(f => (
-            <div key={f.key}>
-              <label style={{ display: 'block', fontSize: 12, color: 'var(--text2)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>{f.label}</label>
-              <input
-                type={f.type}
-                value={values[f.key] || ''}
-                onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))}
-                placeholder={f.placeholder}
-                style={{ width: '100%', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, padding: '9px 12px', color: 'var(--text1)', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
-              />
-            </div>
-          ))}
-        </div>
-        <button
-          onClick={save} disabled={saving}
-          style={{ display:'flex', alignItems:'center', gap:6, marginTop:24, padding:'9px 20px', background:'var(--accent)', border:'none', borderRadius:8, color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer', opacity: saving ? 0.6 : 1 }}>
-          <Save size={14} /> {saving ? 'Saving…' : 'Save Settings'}
-        </button>
-      </div>
-    </div>
-  )
-}
-
 // ══════════════════════════════════════════════════════════════
 // ROOT SHELL
 // ══════════════════════════════════════════════════════════════
@@ -1592,8 +1917,8 @@ const NAV = [
   { id: 'dashboard',     icon: Activity,       label: 'Dashboard'     },
   { id: 'leads',         icon: Users,          label: 'Leads'         },
   { id: 'conversations', icon: FileText,       label: 'Conversations' },
-  { id: 'forms',         icon: ClipboardList,  label: 'Forms', badgeKey: 'forms' },
   { id: 'analytics',     icon: BarChart2,      label: 'Analytics'     },
+  { id: 'forms',         icon: ClipboardList,  label: 'Forms', badgeKey: 'forms' },
   { id: 'prompt',        icon: MessageSquare,  label: 'Agent Prompt'  },
   { id: 'settings',      icon: Settings,       label: 'Settings'      },
 ]
@@ -1745,7 +2070,7 @@ export default function Dashboard() {
         {page === 'forms'         && <PageForms         showToast={showToast} globalSearch={globalSearch} setFormCount={setFormCount} />}
         {page === 'analytics'     && <PageAnalytics     records={records} stats={stats} loading={loading} />}
         {page === 'prompt'        && <PagePrompt        showToast={showToast} />}
-        {page === 'settings'      && <PageSettings      showToast={showToast} onConfigChange={cfg => setAgentConfig(c => ({ ...c, ...cfg }))} />}
+        {page === 'settings' && <PageSettings supabase={supabase} showToast={showToast} onConfigChange={cfg => setAgentConfig(c => ({ ...c, ...cfg }))} />}
       </main>
 
       {selected && (
