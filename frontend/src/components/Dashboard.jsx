@@ -826,7 +826,7 @@ function PageConversations({ records, loading, openTranscript, globalSearch }) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// PAGE: FORMS  —  fully refactored
+// PAGE: FORMS  —  Gmail OAuth Direct Send + Setup Guide
 // ══════════════════════════════════════════════════════════════
 
 // ── helpers ──────────────────────────────────────────────────
@@ -838,34 +838,135 @@ const inputStyle = {
 }
 const labelStyle = { fontSize: 11, color: 'var(--text2)', marginBottom: 4, display: 'block' }
 
-async function sendFormEmail(email, name, formUrl) {
-  const { data, error } = await supabase.functions.invoke('send-form-email', {
-    body: { email, name, formUrl }
-  })
-  if (error) throw new Error(error.message)
-  if (data?.error) throw new Error(data.error)
-  return data
+// ── Gmail token store (in-memory, persists till refresh) ──────
+let gmailAccessToken = null
+
+// ── Gmail connect hook ────────────────────────────────────────
+function useGmailAuth() {
+  const [connected,  setConnected]  = useState(!!gmailAccessToken)
+  const [userEmail,  setUserEmail]  = useState(localStorage.getItem('gmail_sender') || '')
+
+  function connect() {
+    if (!window.google?.accounts?.oauth2) {
+      alert('Google Identity script not loaded. Add to index.html:\n<script src="https://accounts.google.com/gsi/client" async></script>')
+      return
+    }
+    if (!import.meta.env.VITE_GOOGLE_CLIENT_ID) {
+      alert('VITE_GOOGLE_CLIENT_ID missing in .env file. See Gmail Setup Guide.')
+      return
+    }
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
+      scope: 'https://www.googleapis.com/auth/gmail.send email profile',
+      callback: async (response) => {
+        if (response.error) return
+        gmailAccessToken = response.access_token
+        const info = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${gmailAccessToken}` }
+        }).then(r => r.json())
+        localStorage.setItem('gmail_sender', info.email)
+        setUserEmail(info.email)
+        setConnected(true)
+      }
+    })
+    client.requestAccessToken()
+  }
+
+  function disconnect() {
+    gmailAccessToken = null
+    setConnected(false)
+    setUserEmail('')
+    localStorage.removeItem('gmail_sender')
+  }
+
+  return { connected, userEmail, connect, disconnect }
 }
 
+// ── Send email via Gmail API ──────────────────────────────────
+async function sendViaGmail(to, name, formUrl) {
+  if (!gmailAccessToken) throw new Error('Gmail not connected')
+
+  const subject = 'Quick Form – Help Us Understand Your Requirements'
+  const html = `
+    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px">
+      <h2 style="color:#111">Hi ${name || 'there'},</h2>
+      <p style="color:#555;font-size:15px;line-height:1.6">
+        Please fill out this quick form so we can understand your requirements better.
+      </p>
+      <a href="${formUrl}"
+        style="display:inline-block;margin-top:8px;padding:12px 28px;background:#6366f1;
+               color:#fff;border-radius:8px;text-decoration:none;font-weight:600">
+        Open Form →
+      </a>
+      <p style="color:#aaa;font-size:12px;margin-top:24px">
+        Or copy: <a href="${formUrl}">${formUrl}</a>
+      </p>
+    </div>
+  `
+
+  const message = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `MIME-Version: 1.0`,
+    `Content-Type: text/html; charset=utf-8`,
+    ``,
+    html
+  ].join('\n')
+
+  const encoded = btoa(unescape(encodeURIComponent(message)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+
+  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${gmailAccessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ raw: encoded })
+  })
+
+  if (!res.ok) {
+    const err = await res.json()
+    if (res.status === 401) {
+      gmailAccessToken = null
+      throw new Error('Gmail session expired. Please reconnect.')
+    }
+    throw new Error(err.error?.message || 'Gmail send failed')
+  }
+
+  return await res.json()
+}
+
+// ── FormSetupModal ────────────────────────────────────────────
 // ── FormSetupModal ────────────────────────────────────────────
 function FormSetupModal({ onClose, onSave, showToast }) {
   const [gmailHint, setGmailHint] = useState(localStorage.getItem('form_gmail') || '')
   const [formUrl,   setFormUrl]   = useState(localStorage.getItem('google_form_url') || '')
-  const [saved,     setSaved]     = useState(() => JSON.parse(localStorage.getItem('saved_forms') || '[]'))
+  const [label,     setLabel]     = useState('')   // FIX 1: was missing, caused silent crash
+  const [saving,    setSaving]    = useState(false)
 
-  function handleSave() {
+  async function handleSave() {
     if (!formUrl.includes('docs.google.com/forms')) {
       showToast('Paste a valid Google Form URL'); return
     }
+
+    setSaving(true)
+    const { error } = await supabase.from('forms').upsert({
+      form_url:    formUrl,
+      label:       label.trim() || `Form ${new Date().toLocaleDateString()}`,  // FIX 1: label now defined
+      gmail:       gmailHint,
+      created_by:  localStorage.getItem('gmail_sender') || '',
+      last_used_at: new Date().toISOString()
+    }, { onConflict: 'form_url' })
+
+    setSaving(false)
+
+    if (error) { showToast('Save failed: ' + error.message); return }
+
     localStorage.setItem('google_form_url', formUrl)
     localStorage.setItem('form_gmail', gmailHint)
-    const existing = JSON.parse(localStorage.getItem('saved_forms') || '[]')
-    if (!existing.find(f => f.url === formUrl)) {
-      existing.unshift({ url: formUrl, label: `Form ${existing.length + 1}`, gmail: gmailHint, addedAt: new Date().toISOString() })
-      localStorage.setItem('saved_forms', JSON.stringify(existing))
-    }
     onSave(formUrl)
-    showToast('Form URL saved!')
+    showToast('Form saved!')
     onClose()
   }
 
@@ -875,7 +976,13 @@ function FormSetupModal({ onClose, onSave, showToast }) {
         <h3 style={{ margin:0, fontSize:15, color:'var(--text1)' }}>Google Form Setup</h3>
 
         <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-          <label style={labelStyle}>Sender Gmail (saved for next time)</label>
+          <label style={labelStyle}>Form Name (optional)</label>
+          <input value={label} onChange={e => setLabel(e.target.value)}
+            placeholder="e.g. Onboarding Form, Discovery Call" style={inputStyle} />
+        </div>
+
+        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+          <label style={labelStyle}>Sender Gmail (saved for reference)</label>
           <input value={gmailHint} onChange={e => setGmailHint(e.target.value)}
             placeholder="yourname@gmail.com" style={inputStyle} />
         </div>
@@ -895,23 +1002,7 @@ function FormSetupModal({ onClose, onSave, showToast }) {
           <span style={{ fontSize:10, color:'var(--text3)' }}>Google Forms → Share → Copy link → paste here</span>
         </div>
 
-        {saved.length > 0 && (
-          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-            <label style={labelStyle}>Previously saved forms</label>
-            <div style={{ maxHeight:120, overflowY:'auto', display:'flex', flexDirection:'column', gap:4 }}>
-              {saved.map((f, i) => (
-                <div key={i} onClick={() => setFormUrl(f.url)}
-                  style={{ padding:'6px 10px', borderRadius:7, border:'0.5px solid var(--border2)',
-                    background: formUrl === f.url ? 'var(--accent)' : 'var(--bg3)',
-                    color: formUrl === f.url ? '#fff' : 'var(--text1)',
-                    fontSize:12, cursor:'pointer', display:'flex', justifyContent:'space-between' }}>
-                  <span>{f.label}{f.gmail ? ` · ${f.gmail}` : ''}</span>
-                  <span style={{ fontSize:10, opacity:0.6 }}>{fmtDate(f.addedAt)}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* FIX 2: removed stale localStorage "saved forms" section — library now reads from DB */}
 
         <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
           <button onClick={onClose}
@@ -919,10 +1010,11 @@ function FormSetupModal({ onClose, onSave, showToast }) {
               background:'var(--bg3)', color:'var(--text2)', fontSize:13, cursor:'pointer' }}>
             Cancel
           </button>
-          <button onClick={handleSave} disabled={!formUrl}
+          <button onClick={handleSave} disabled={!formUrl || saving}
             style={{ padding:'7px 16px', borderRadius:8, border:'none',
-              background:'var(--accent)', color:'#fff', fontSize:13, cursor:'pointer', opacity: !formUrl ? 0.5 : 1 }}>
-            Save & Use
+              background:'var(--accent)', color:'#fff', fontSize:13, cursor: (!formUrl || saving) ? 'not-allowed' : 'pointer',
+              opacity: (!formUrl || saving) ? 0.5 : 1 }}>
+            {saving ? 'Saving…' : 'Save & Use'}
           </button>
         </div>
       </div>
@@ -932,13 +1024,35 @@ function FormSetupModal({ onClose, onSave, showToast }) {
 
 // ── FormLibraryModal ──────────────────────────────────────────
 function FormLibraryModal({ onClose, onUse, showToast }) {
-  const [forms, setForms] = useState(() => JSON.parse(localStorage.getItem('saved_forms') || '[]'))
+  const [forms,   setForms]   = useState([])
+  const [loading, setLoading] = useState(true)
 
-  function deleteForm(url) {
-    const updated = forms.filter(f => f.url !== url)
-    setForms(updated)
-    localStorage.setItem('saved_forms', JSON.stringify(updated))
+  useEffect(() => {
+    supabase.from('forms')
+      .select('*')
+      .order('last_used_at', { ascending: false, nullsLast: true })
+      .then(({ data, error }) => {
+        if (error) showToast('Load failed: ' + error.message)
+        setForms(data || [])
+        setLoading(false)
+      })
+  }, [])
+
+  async function deleteForm(id) {
+    const { error } = await supabase.from('forms').delete().eq('id', id)
+    if (error) { showToast('Delete failed'); return }
+    setForms(f => f.filter(x => x.id !== id))
     showToast('Form removed')
+  }
+
+  async function useForm(form) {
+    await supabase.from('forms')
+      .update({ last_used_at: new Date().toISOString() })
+      .eq('id', form.id)
+    localStorage.setItem('google_form_url', form.form_url)
+    onUse(form.form_url)
+    showToast('Now using: ' + form.label)
+    onClose()
   }
 
   return (
@@ -953,40 +1067,46 @@ function FormLibraryModal({ onClose, onUse, showToast }) {
           </button>
         </div>
 
-        {forms.length === 0 ? (
+        {loading ? (
+          <div style={{ textAlign:'center', padding:'32px 0', color:'var(--text3)', fontSize:13 }}>
+            Loading…
+          </div>
+        ) : forms.length === 0 ? (
           <div style={{ textAlign:'center', padding:'32px 0', color:'var(--text3)', fontSize:13 }}>
             No saved forms. Use ⚙️ Setup Form to add one.
           </div>
         ) : (
           <div style={{ overflowY:'auto', display:'flex', flexDirection:'column', gap:10 }}>
-            {forms.map((f, i) => (
-              <div key={i} style={{ background:'var(--bg3)', border:'0.5px solid var(--border2)',
-                borderRadius:10, padding:'14px 16px', display:'flex', flexDirection:'column', gap:8 }}>
+            {forms.map(f => (
+              <div key={f.id}   // FIX 3: use f.id not index
+                style={{ background:'var(--bg3)', border:'0.5px solid var(--border2)',
+                  borderRadius:10, padding:'14px 16px', display:'flex', flexDirection:'column', gap:8 }}>
                 <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
                   <div>
                     <div style={{ fontWeight:600, fontSize:13, color:'var(--text1)' }}>{f.label}</div>
                     {f.gmail && <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{f.gmail}</div>}
-                    <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{fmtDate(f.addedAt)}</div>
+                    {f.created_by && <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>Added by {f.created_by}</div>}
+                    <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{fmtDate(f.created_at)}</div>
                   </div>
                 </div>
-                <div style={{ fontSize:11, color:'var(--text3)', wordBreak:'break-all' }}>{f.url}</div>
+                <div style={{ fontSize:11, color:'var(--text3)', wordBreak:'break-all' }}>{f.form_url}</div>
                 <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
-                  <button onClick={() => window.open(f.url, '_blank')}
+                  <button onClick={() => window.open(f.form_url, '_blank')}
                     style={{ padding:'5px 12px', borderRadius:7, border:'0.5px solid var(--border2)',
                       background:'var(--bg2)', color:'var(--text1)', fontSize:12, cursor:'pointer' }}>
                     🔗 Open
                   </button>
-                  <button onClick={() => { onUse(f.url); showToast(`Now using: ${f.label}`); onClose() }}
+                  <button onClick={() => useForm(f)}   // FIX 3: single call, no double-fire
                     style={{ padding:'5px 12px', borderRadius:7, border:'none',
                       background:'var(--accent)', color:'#fff', fontSize:12, cursor:'pointer' }}>
                     ✓ Use Form
                   </button>
-                  <button onClick={() => { navigator.clipboard.writeText(f.url); showToast('URL copied') }}
+                  <button onClick={() => { navigator.clipboard.writeText(f.form_url); showToast('URL copied') }}
                     style={{ padding:'5px 12px', borderRadius:7, border:'0.5px solid var(--border2)',
                       background:'var(--bg2)', color:'var(--text2)', fontSize:12, cursor:'pointer' }}>
                     <Copy size={12}/>
                   </button>
-                  <button onClick={() => deleteForm(f.url)}
+                  <button onClick={() => deleteForm(f.id)}
                     style={{ padding:'5px 12px', borderRadius:7, border:'0.5px solid rgba(239,68,68,0.3)',
                       background:'rgba(239,68,68,0.08)', color:'#ef4444', fontSize:12, cursor:'pointer' }}>
                     Delete
@@ -1000,12 +1120,10 @@ function FormLibraryModal({ onClose, onUse, showToast }) {
     </div>
   )
 }
-
-// ── SendFormModal ─────────────────────────────────────────────
-function SendFormModal({ onClose, onSent, showToast, formUrl }) {
+// ── SendFormModal (Gmail OAuth version) ──────────────────────
+function SendFormModal({ onClose, onSent, showToast, formUrl, gmailAuth }) {
   const [name,      setName]      = useState('')
   const [leadEmail, setLeadEmail] = useState('')
-  const [rep,       setRep]       = useState(localStorage.getItem('form_rep') || '')
   const [busy,      setBusy]      = useState(false)
   const [sent,      setSent]      = useState(false)
 
@@ -1013,27 +1131,25 @@ function SendFormModal({ onClose, onSent, showToast, formUrl }) {
 
   async function handleSend() {
     if (!leadEmail.trim())        { showToast('Email is required'); return }
-    if (!isValidEmail(leadEmail)) { showToast('Enter a valid email address'); return }
+    if (!isValidEmail(leadEmail)) { showToast('Enter a valid email'); return }
     if (!formUrl)                 { showToast('No form URL — click ⚙️ Setup Form'); return }
+    if (!gmailAuth.connected)     { showToast('Connect Gmail first'); return }
 
     setBusy(true)
     try {
-      // log first
-      const { error: logErr } = await supabase.from('form_send_log').insert({
-        lead_name: name, lead_email: leadEmail, sent_by: rep, form_url: formUrl
+      await sendViaGmail(leadEmail, name, formUrl)
+
+      await supabase.from('form_send_log').insert({
+        lead_name: name, lead_email: leadEmail,
+        sent_by: gmailAuth.userEmail, form_url: formUrl
       })
-      if (logErr) { showToast('Log error: ' + logErr.message); return }
 
-      // send via edge fn
-      await sendFormEmail(leadEmail, name, formUrl)
-
-      localStorage.setItem('form_rep', rep)
       setSent(true)
       showToast(`Email sent to ${leadEmail}`)
       setTimeout(() => { onSent(); onClose() }, 1000)
-
     } catch (err) {
-      showToast('Send failed: ' + err.message)
+      showToast(err.message)
+      if (err.message.includes('reconnect')) gmailAuth.connect()
     } finally {
       setBusy(false)
     }
@@ -1044,22 +1160,34 @@ function SendFormModal({ onClose, onSent, showToast, formUrl }) {
       <div style={{ background:'var(--bg2)', border:'0.5px solid var(--border2)', borderRadius:12, padding:28, width:520, display:'flex', flexDirection:'column', gap:18 }}>
         <h3 style={{ margin:0, fontSize:15, color:'var(--text1)' }}>Send Form via Email</h3>
 
+        {/* Gmail status */}
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+          padding:'10px 14px', borderRadius:8, background:'var(--bg3)', border:'0.5px solid var(--border2)' }}>
+          <span style={{ fontSize:12, color: gmailAuth.connected ? '#22c55e' : 'var(--text3)' }}>
+            {gmailAuth.connected ? `✓ Sending as ${gmailAuth.userEmail}` : '⚠ Gmail not connected'}
+          </span>
+          <button onClick={gmailAuth.connected ? gmailAuth.disconnect : gmailAuth.connect}
+            style={{ padding:'4px 12px', borderRadius:6, border:'0.5px solid var(--border2)',
+              background:'var(--bg2)', color:'var(--text1)', fontSize:11, cursor:'pointer' }}>
+            {gmailAuth.connected ? 'Disconnect' : 'Connect Gmail'}
+          </button>
+        </div>
+
         {!formUrl && (
           <div style={{ padding:'10px 14px', borderRadius:8, background:'rgba(239,68,68,0.1)',
             border:'0.5px solid rgba(239,68,68,0.3)', color:'#ef4444', fontSize:12 }}>
-            ⚠️ No form URL configured. Close and click ⚙️ Setup Form first.
+            ⚠️ No form URL. Close and click ⚙️ Setup Form.
           </div>
         )}
 
         {[
           { label:'Lead Email *', val:leadEmail, set:setLeadEmail, ph:'lead@example.com', type:'email' },
           { label:'Lead Name',    val:name,      set:setName,      ph:'Full name',        type:'text'  },
-          { label:'Sent By',      val:rep,       set:setRep,       ph:'Sales rep name',   type:'text'  },
         ].map(({ label, val, set, ph, type }) => (
           <div key={label} style={{ display:'flex', flexDirection:'column', gap:6 }}>
             <label style={labelStyle}>{label}</label>
             <input type={type} value={val} onChange={e => set(e.target.value)}
-              placeholder={ph} style={inputStyle} />
+              placeholder={ph} style={inputStyle}/>
           </div>
         ))}
 
@@ -1069,11 +1197,12 @@ function SendFormModal({ onClose, onSent, showToast, formUrl }) {
               background:'var(--bg3)', color:'var(--text2)', fontSize:13, cursor:'pointer' }}>
             Cancel
           </button>
-          <button onClick={handleSend} disabled={busy || !leadEmail || !formUrl}
-            style={{ padding:'8px 20px', borderRadius:8, border:'none',
-              background: sent ? '#22c55e' : 'var(--accent)', color:'#fff', fontSize:13,
-              cursor:'pointer', display:'flex', alignItems:'center', gap:6,
-              opacity:(busy || !leadEmail || !formUrl) ? 0.5 : 1, minWidth:120, justifyContent:'center' }}>
+          <button onClick={handleSend}
+            disabled={busy || !leadEmail || !formUrl || !gmailAuth.connected}
+            style={{ padding:'8px 20px', borderRadius:8, border:'none', fontSize:13,
+              background: sent ? '#22c55e' : 'var(--accent)', color:'#fff', cursor:'pointer',
+              display:'flex', alignItems:'center', gap:6, minWidth:130, justifyContent:'center',
+              opacity:(busy || !leadEmail || !formUrl || !gmailAuth.connected) ? 0.5 : 1 }}>
             {sent ? '✓ Sent!' : busy ? 'Sending…' : '📧 Send Email'}
           </button>
         </div>
@@ -1083,7 +1212,7 @@ function SendFormModal({ onClose, onSent, showToast, formUrl }) {
 }
 
 // ── SendLogTab ────────────────────────────────────────────────
-function SendLogTab({ showToast, formUrl }) {
+function SendLogTab({ showToast, formUrl, gmailAuth }) {
   const [log,     setLog]     = useState([])
   const [loading, setLoading] = useState(true)
 
@@ -1096,13 +1225,15 @@ function SendLogTab({ showToast, formUrl }) {
   }, [])
 
   async function handleResend(l) {
+    if (!gmailAuth.connected) { showToast('Connect Gmail first'); return }
     const url = l.form_url || formUrl
     if (!url) { showToast('No form URL available'); return }
     try {
-      await sendFormEmail(l.lead_email, l.lead_name, url)
-      showToast(`Reminder email sent to ${l.lead_email}`)
+      await sendViaGmail(l.lead_email, l.lead_name, url)
+      showToast(`Reminder sent to ${l.lead_email}`)
     } catch (err) {
       showToast('Resend failed: ' + err.message)
+      if (err.message.includes('reconnect')) gmailAuth.connect()
     }
   }
 
@@ -1162,7 +1293,10 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
   const [showModal,      setShowModal]      = useState(false)
   const [showSetup,      setShowSetup]      = useState(false)
   const [showLibrary,    setShowLibrary]    = useState(false)
+  // const [showGuide,      setShowGuide]      = useState(false)
   const [formUrl,        setFormUrl]        = useState(localStorage.getItem('google_form_url') || '')
+
+  const gmailAuth = useGmailAuth()
 
   function loadSubmissions() {
     setLoading(true); setFetchError(null)
@@ -1195,9 +1329,10 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
 
   return (
     <>
-      {showSetup   && <FormSetupModal   onClose={() => setShowSetup(false)}   onSave={handleUseForm} showToast={showToast} />}
-      {showLibrary && <FormLibraryModal onClose={() => setShowLibrary(false)} onUse={handleUseForm}  showToast={showToast} />}
-      {showModal   && <SendFormModal    onClose={() => setShowModal(false)}   onSent={() => {}}      showToast={showToast} formUrl={formUrl} />}
+      {showSetup   && <FormSetupModal      onClose={() => setShowSetup(false)}   onSave={handleUseForm} showToast={showToast} />}
+      {showLibrary && <FormLibraryModal    onClose={() => setShowLibrary(false)} onUse={handleUseForm}  showToast={showToast} />}
+      {/* {showGuide   && <GmailSetupGuideModal onClose={() => setShowGuide(false)} />} */}
+      {showModal   && <SendFormModal       onClose={() => setShowModal(false)}   onSent={() => {}}      showToast={showToast} formUrl={formUrl} gmailAuth={gmailAuth} />}
 
       {fetchError && (
         <div className={styles.errorBanner} style={{ marginBottom:12 }}>
@@ -1220,7 +1355,7 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
           ))}
         </div>
 
-        <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+        <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
           {tab === 'responses' && (
             <span style={{ fontSize:12, color:'var(--text2)' }}>{filtered.length} submissions</span>
           )}
@@ -1231,6 +1366,23 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
             border: `0.5px solid ${formUrl ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}` }}>
             {formUrl ? '✓ Form set' : '⚠ No form'}
           </span>
+
+          {/* Gmail connect pill */}
+          <button onClick={gmailAuth.connected ? gmailAuth.disconnect : gmailAuth.connect}
+            style={{ padding:'6px 12px', borderRadius:8, fontSize:11, cursor:'pointer',
+              border:'0.5px solid var(--border2)',
+              background: gmailAuth.connected ? 'rgba(34,197,94,0.1)' : 'var(--bg3)',
+              color: gmailAuth.connected ? '#22c55e' : 'var(--text2)',
+              maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {gmailAuth.connected ? `✓ ${gmailAuth.userEmail}` : '🔗 Connect Gmail'}
+          </button>
+
+          {/* Gmail setup guide */}
+          {/* <button onClick={() => setShowGuide(true)}
+            style={{ padding:'6px 12px', borderRadius:8, border:'0.5px solid var(--border2)',
+              background:'var(--bg3)', color:'var(--text2)', fontSize:11, cursor:'pointer' }}>
+            📖 Gmail Guide
+          </button> */}
 
           <button onClick={() => setShowSetup(true)}
             style={{ padding:'6px 14px', borderRadius:8, border:'0.5px solid var(--border2)',
@@ -1301,10 +1453,11 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
                         </button>
                         <button className={styles.iconBtn} title="Send Form Email"
                           onClick={async () => {
+                            if (!gmailAuth.connected) { showToast('Connect Gmail first'); return }
                             if (!formUrl) { showToast('No form URL configured'); return }
                             if (!s.email) { showToast('No email for this lead'); return }
                             try {
-                              await sendFormEmail(s.email, s.name, formUrl)
+                              await sendViaGmail(s.email, s.name, formUrl)
                               showToast(`Form sent to ${s.email}`)
                             } catch (err) {
                               showToast('Send failed: ' + err.message)
@@ -1321,7 +1474,7 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
           </div>
         </div>
       ) : (
-        <SendLogTab showToast={showToast} formUrl={formUrl}/>
+        <SendLogTab showToast={showToast} formUrl={formUrl} gmailAuth={gmailAuth}/>
       )}
     </>
   )
