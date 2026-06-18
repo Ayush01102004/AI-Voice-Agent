@@ -1,36 +1,36 @@
-# Inbox Infotech — AI Voice Sales Agent Dashboard
+# Inbox Infotech — AI Voice Sales Agent
 
-A production-ready AI voice sales agent system with a full-stack dashboard. Twilio handles telephony, Deepgram powers real-time STT + TTS + agent reasoning, Groq extracts lead insights, and a React + Supabase dashboard gives you live visibility into every call.
+Production-ready AI voice sales agent with real-time telephony, automated lead extraction, and a live dashboard.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-Incoming Call
+Outbound Call
      │
      ▼
-Twilio (PSTN)
-     │  POST /twilio/voice  →  TwiML (<Stream>)
-     │  wss://.../ws/twilio →  Media Streams (mulaw 8kHz)
+Telnyx (PSTN)
+     │  POST /telnyx/voice      →  TeXML (<Stream>)
+     │  wss://.../ws/telnyx     →  Media Streams (mulaw 8kHz)
      ▼
-server.py  (aiohttp, port 5002)
+voice_agent.py  (aiohttp, port 5002)
      │  Deepgram Voice Agent SDK (WebSocket)
-     │  ← audio in / audio out (mulaw)
+     │  ← audio in / audio out (mulaw 8kHz)
      │  ← ConversationText, FunctionCallRequest
      │
-     │  GET http://localhost:8000/api/config  →  live system prompt
+     │  GET http://localhost:8000/api/config  →  live system prompt + lead_name
      ▼
 call_handler.py  (FastAPI, port 8000)
-     │  POST /twilio-webhook  ←  Twilio status callback (call completed)
-     │  Deepgram REST API  →  transcription (nova-3, diarized)
-     │  Groq llama-3.3-70b  →  lead extraction (JSON)
-     │  Supabase  →  persist calls, lead_notes, agent_config
-     │  N8N hot lead webhook  →  HOT lead automation
+     │  POST /telnyx-webhook    ←  Telnyx call.completed / call.recording.saved
+     │  Deepgram REST API       →  transcription (nova-3, diarized)
+     │  Groq llama-3.3-70b      →  lead extraction (JSON)
+     │  Supabase                →  persist calls, lead_notes, agent_config
+     │  N8N webhook             →  HOT lead automation
      ▼
 React Dashboard  (Vite, port 5173)
-     │  Supabase JS client  →  reads all tables directly
-     │  Pages: Overview, Leads, Calls, Settings (+ Admin DB Panel)
+     Supabase JS client  →  reads all tables directly
+     Pages: Overview · Leads · Calls · Settings · Admin DB Panel
 ```
 
 ---
@@ -40,16 +40,16 @@ React Dashboard  (Vite, port 5173)
 ```
 /
 ├── backend/
-│   ├── server.py           # Deepgram Voice Agent + Twilio WebSocket bridge
+│   ├── voice_agent.py      # Deepgram Voice Agent + Telnyx WebSocket bridge
 │   ├── call_handler.py     # FastAPI: webhooks, transcription, extraction, storage
 │   └── requirements.txt
 ├── frontend/
 │   └── src/
 │       └── components/
-│           ├── Dashboard.jsx         # Root layout + page routing
-│           ├── PageSettings.jsx      # Settings + admin login
-│           └── PageAdminPanel.jsx    # Embedded DB admin UI (admin-only)
-└── .env                    # See Environment Variables section
+│           ├── Dashboard.jsx
+│           ├── PageSettings.jsx
+│           └── PageAdminPanel.jsx
+└── .env
 ```
 
 ---
@@ -58,88 +58,82 @@ React Dashboard  (Vite, port 5173)
 
 | Layer | Technology |
 |---|---|
-| Telephony | Twilio Media Streams (mulaw 8 kHz) |
-| Voice Agent | Deepgram Voice Agent SDK v5+ (STT: nova-3, TTS: aura-2-helena-en, LLM: gpt-4o-mini) |
-| Transcription | Deepgram REST API (nova-3, diarized, punctuated) |
+| Telephony | Telnyx Media Streams (mulaw 8 kHz) |
+| Voice Agent | Deepgram Voice Agent SDK v5+ · STT: nova-3 · TTS: aura-2-helena-en · LLM: gpt-4o-mini |
+| Transcription | Deepgram REST API (nova-3, diarized) |
 | Lead Extraction | Groq `llama-3.3-70b-versatile` |
-| Backend Framework | FastAPI + aiohttp |
+| Backend | FastAPI + aiohttp |
 | Database | Supabase (PostgreSQL) |
-| Automation | N8N webhook (HOT lead trigger) |
-| Frontend | React + Vite |
-| Frontend DB Client | Supabase JS |
-| Icons | Lucide React |
+| Automation | N8N webhook |
+| Frontend | React + Vite + Supabase JS |
 
 ---
 
 ## Environment Variables
 
-Create a `.env` file in the project root:
-
 ```env
 # Deepgram
-DEEPGRAM_API_KEY=your_deepgram_api_key
+DEEPGRAM_API_KEY=
 
 # Groq
-GROQ_API_KEY=your_groq_api_key
+GROQ_API_KEY=
 
 # Supabase
 SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+SUPABASE_SERVICE_ROLE_KEY=
 
-# Twilio (used by Make.com / outbound trigger)
-TWILIO_ACCOUNT_SID=your_account_sid
-TWILIO_AUTH_TOKEN=your_auth_token
-TWILIO_FROM_NUMBER=+1xxxxxxxxxx
+# Telnyx
+TELNYX_API_KEY=
+TELNYX_PUBLIC_KEY=           # Ed25519 public key for webhook signature verification
 
 # N8N
-N8N_WEBHOOK_URL=https://hook.make.com/your-webhook-id
+N8N_WEBHOOK_URL=
 
-# Internal service wiring (default works for same-machine dev)
+# Internal wiring (defaults work for same-machine dev)
 CALL_HANDLER_URL=http://localhost:8000
+PORT=5002
+
+# Optional: per-campaign lead name (overrides agent_config table)
+LEAD_NAME=
 ```
 
 ---
 
 ## Supabase Schema
 
-Run these in the Supabase SQL editor:
-
 ```sql
--- Agent configuration (system prompt, connections, etc.)
 create table agent_config (
-  key         text primary key,
-  value       text not null default '',
-  updated_at  timestamptz not null default now()
+  key        text primary key,
+  value      text not null default '',
+  updated_at timestamptz not null default now()
 );
 
--- Call records
 create table calls (
-  id                uuid primary key default gen_random_uuid(),
-  call_sid          text unique not null,
-  from_number       text,
-  to_number         text,
-  duration_sec      int default 0,
-  transcript        text,
-  lead_category     text default 'COLD',
-  lead_score        int default 1,
-  extracted         jsonb,
-  recording_url     text,
-  source            text default 'Unknown',
-  name              text default '',
+  id               uuid primary key default gen_random_uuid(),
+  call_sid         text unique not null,
+  from_number      text,
+  to_number        text,
+  duration_sec     int default 0,
+  transcript       text,
+  lead_category    text default 'COLD',
+  lead_score       int default 1,
+  extracted        jsonb,
+  recording_url    text,
+  source           text default 'Unknown',
+  name             text default '',
+  company          text default '',
   last_contacted_at timestamptz,
-  created_at        timestamptz not null default now()
+  created_at       timestamptz not null default now()
 );
 
--- Lead notes (added from dashboard)
 create table lead_notes (
-  id        uuid primary key default gen_random_uuid(),
-  call_sid  text references calls(call_sid) on delete cascade,
-  note      text not null,
-  author    text default 'Admin',
+  id         uuid primary key default gen_random_uuid(),
+  call_sid   text references calls(call_sid) on delete cascade,
+  note       text not null,
+  author     text default 'Admin',
   created_at timestamptz not null default now()
 );
 
--- Web form submissions
 create table form_submissions (
   id                   uuid primary key default gen_random_uuid(),
   name                 text,
@@ -151,7 +145,6 @@ create table form_submissions (
   submitted_at         timestamptz not null default now()
 );
 
--- Prompt version history
 create table prompt_versions (
   id            uuid primary key default gen_random_uuid(),
   prompt_key    text not null,
@@ -161,12 +154,12 @@ create table prompt_versions (
 );
 ```
 
-Seed the default system prompt:
+Seed defaults:
 
 ```sql
 insert into agent_config (key, value) values
-  ('system_prompt', 'You are Alex, a friendly sales caller from Inbox Infotech...'),
-  ('agent_name', 'Alex')
+  ('system_prompt', 'You are Ella, a friendly sales caller from Inbox Infotech...'),
+  ('agent_name',    'Ella')
 on conflict (key) do nothing;
 ```
 
@@ -181,166 +174,134 @@ pip install -r requirements.txt
 
 **requirements.txt**
 ```
-deepgram-sdk>=3.0.0
-websockets>=12.0
-python-dotenv>=1.0.0
+deepgram-sdk>=5.0.0
+aiohttp>=3.9
+python-dotenv>=1.0
 fastapi
 uvicorn
 httpx
-openai
-aiohttp
 groq
-twilio
 supabase==2.4.2
+cryptography
 ```
 
-### Start call_handler (FastAPI)
+### Start call_handler (port 8000)
 
 ```bash
 uvicorn call_handler:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Endpoints:
-
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/twilio-webhook` | Twilio status callback (call completed) |
-| GET | `/api/leads` | Paginated lead list with extraction data |
-| GET | `/api/stats` | Aggregate stats (total, HOT/WARM/COLD, avg score) |
+| POST | `/telnyx-webhook` | Telnyx `call.completed` / `call.recording.saved` |
+| GET | `/api/leads` | Paginated lead list |
+| GET | `/api/stats` | Aggregate stats |
 | GET | `/api/transcript/{call_sid}` | Parsed diarized transcript |
-| GET | `/api/config` | Live agent config for server.py |
+| GET | `/api/config` | Live agent config for voice_agent.py |
 | POST | `/api/config/refresh` | Force-bust 5-min config cache |
 | GET | `/health` | Health check + DB connectivity |
 
-### Start server.py (Deepgram Voice Agent)
+### Start voice_agent (port 5002)
 
 ```bash
-python server.py
+python voice_agent.py
 ```
-
-Endpoints:
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/twilio/voice` | Twilio webhook — returns TwiML `<Stream>` |
-| GET | `/ws/twilio` | Twilio Media Streams WebSocket |
-| GET | `/health` | Health check + prompt loaded status |
+| POST | `/telnyx/voice` | Telnyx webhook — returns TeXML `<Stream>` |
+| GET | `/ws/telnyx` | Telnyx Media Streams WebSocket |
+| GET | `/health` | Health check + prompt loaded |
+| GET | `/ping` | Liveness probe |
 
-### Expose to Twilio (development)
+### Expose publicly (development)
 
 ```bash
-ngrok http 5002
+ngrok http 5002   # voice_agent
+ngrok http 8000   # call_handler (separate terminal)
 ```
-
-Set Twilio webhook:
-- Voice URL: `https://your-ngrok-id.ngrok.io/twilio/voice`  (HTTP POST)
-- Status Callback: `https://your-ngrok-id.ngrok.io/twilio-webhook` on `call_handler` port 8000
-
-For production, deploy both services and point Twilio to their public URLs.
 
 ---
 
-## Frontend Setup
+## Telnyx Configuration
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Create `frontend/.env`:
-
-```env
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_ANON_KEY=your_anon_key
-```
-
-### Pages
-
-| Page | Description |
-|---|---|
-| Overview | Stats cards, lead category chart, top sources, recent activity |
-| Leads | Full lead table with filters, lead score badge, transcript modal |
-| Calls | Raw call records, recording playback links |
-| Settings | General config, integrations (Teams/Slack/Calendly/Email), admin panel |
-
-### Admin Panel (`PageAdminPanel`)
-
-Accessible only after admin login in Settings. Provides a full embedded database editor:
-
-- Table selector for all 5 Supabase tables
-- Inline cell editing (click to edit, Enter to save, Escape to cancel)
-- JSONB columns: textarea with JSON validation before save
-- Insert row form with type-aware inputs (text / number / jsonb)
-- Delete with inline confirmation step
-- Client-side search across all string columns
-- Pagination at 20 rows/page
-- CSV export of current filtered view
-- Read-only enforcement on `id`, `created_at`, `updated_at`, `submitted_at`
-
-Admin session persists across page navigation via `sessionStorage` — cleared on tab close.
+1. **Voice webhook** (HTTP POST): `https://<voice-agent-host>/telnyx/voice`
+2. **Webhook events** on call_handler: `https://<call-handler-host>/telnyx-webhook`
+   - Enable events: `call.completed`, `call.recording.saved`
+3. Set **TELNYX_PUBLIC_KEY** in `.env` to enable Ed25519 webhook signature verification (recommended for production).
+4. Enable **call recording** in your Telnyx connection profile.
 
 ---
 
-## Call Flow (End to End)
+## Call Flow
 
-1. **Outbound or inbound call** hits Twilio.
-2. Twilio POSTs to `server.py /twilio/voice` → receives TwiML `<Stream>`.
-3. Twilio opens WebSocket to `server.py /ws/twilio`, streams mulaw audio.
-4. `server.py` fetches live system prompt from `call_handler /api/config`.
-5. `server.py` opens Deepgram Voice Agent connection, sends `Settings` (prompt, audio config, greeting, functions).
-6. Deepgram handles STT → LLM (gpt-4o-mini) → TTS in real time.
-7. Agent audio (mulaw) streams back through `server.py` to Twilio → caller.
-8. On `FunctionCallRequest` for `end_conversation`: agent responds, WebSocket closes, Twilio hangs up.
-9. Twilio POSTs status callback to `call_handler /twilio-webhook` once call completes.
-10. `call_handler` downloads recording → Deepgram transcription (diarized) → Groq extraction → Supabase upsert.
-11. If `lead_category == HOT`, Make.com webhook fires for downstream automation.
-12. Dashboard reflects new call data in real time via Supabase JS client.
+1. Telnyx triggers outbound call → POSTs to `/telnyx/voice` → returns TeXML `<Stream>`.
+2. Telnyx opens WebSocket to `/ws/telnyx`, streams mulaw audio.
+3. `voice_agent.py` fetches live config from `call_handler /api/config`.
+4. Deepgram Voice Agent handles STT → LLM (gpt-4o-mini) → TTS in real time.
+5. Agent audio streams back through `voice_agent.py` → Telnyx → caller.
+6. On `end_conversation` function call: WebSocket closes, Telnyx hangs up.
+7. Telnyx POSTs `call.recording.saved` or `call.completed` to `/telnyx-webhook`.
+8. `call_handler` downloads recording → Deepgram transcription → Groq extraction → Supabase upsert.
+9. `lead_category == HOT` → N8N webhook fires.
+10. Dashboard reflects new data in real time via Supabase JS.
 
 ---
 
 ## Agent Configuration (Live Editing)
 
-The system prompt and agent name are stored in `agent_config` and loaded fresh per call:
-
-- Edit `system_prompt` in the dashboard Settings page (admin login required) or via the Admin DB Panel.
-- `call_handler` caches config for 5 minutes (`_CONFIG_TTL = 300`). Hit `POST /api/config/refresh` to bust immediately.
-- `server.py` fetches from `call_handler /api/config` at call start — no restart needed.
-- If `call_handler` is unreachable, `server.py` falls back to `_DEFAULT_SYSTEM_PROMPT`.
+- Edit `system_prompt` and `agent_name` in the Settings page (admin login required) or via Admin DB Panel.
+- `call_handler` caches config for 5 minutes. Bust immediately: `POST /api/config/refresh`.
+- `voice_agent.py` fetches config at call start — no restart required.
+- Set `lead_name` in `agent_config` table (or `LEAD_NAME` env var) to personalise greeting and recovery memory per campaign.
+- Fallback: if `call_handler` is unreachable, `voice_agent.py` uses built-in default prompt.
 
 ---
 
 ## Lead Scoring
 
-Groq `llama-3.3-70b-versatile` scores every call:
+Groq scores every completed call:
 
 | Category | Score | Criteria |
 |---|---|---|
-| HOT | 8–10 | Clear interest + budget indicator + decision maker + urgency |
+| HOT | 8–10 | Clear interest + budget + decision maker + urgency |
 | WARM | 4–7 | Interested but vague on budget/timeline, or not decision maker |
-| COLD | 1–3 | No interest, declined, hung up, wrong number, voicemail |
+| COLD | 1–3 | No interest, declined, wrong number, voicemail, hung up |
 
-Extracted fields saved to `calls.extracted` (jsonb): `name`, `pain_points`, `budget`, `requirements`, `timeline`, `decision_maker`, `industry`, `intent_level`, `summary`, `next_action`, `interested_services`.
+Extracted fields saved to `calls.extracted` (jsonb): `name`, `company`, `pain_points`, `budget`, `requirements`, `timeline`, `decision_maker`, `industry`, `intent_level`, `lead_score`, `lead_category`, `summary`, `next_action`, `interested_services`.
+
+---
+
+## Dashboard
+
+| Page | Description |
+|---|---|
+| Overview | Stats cards, lead category chart, top sources, recent activity |
+| Leads | Lead table with filters, score badge, transcript modal |
+| Calls | Raw call records, recording playback |
+| Settings | Agent config, integrations, admin panel access |
+
+**Admin Panel** (admin login required): full inline DB editor for all 5 tables — edit, insert, delete, search, paginate, CSV export. Session persists via `sessionStorage`.
 
 ---
 
 ## Integrations
 
-| Service | Config key in `agent_config` | Purpose |
+| Service | `agent_config` key | Purpose |
 |---|---|---|
-| Slack | `conn_slack` | HOT lead alerts to Slack channel |
-| Microsoft Teams | `conn_teams` | HOT lead alerts to Teams channel |
-| Calendly | `conn_calendly` | Booking link sent to qualified leads |
-| Email | `conn_email` | Notification email for new leads |
-| N8N | `N8N_WEBHOOK_URL` env var | Full automation workflow on HOT lead |
+| Slack | `conn_slack` | HOT lead channel alerts |
+| Microsoft Teams | `conn_teams` | HOT lead channel alerts |
+| Calendly | `conn_calendly` | Booking link for qualified leads |
+| Email | `conn_email` | New lead notifications |
+| N8N | `N8N_WEBHOOK_URL` env | Full automation on HOT lead |
 
 ---
 
-## Production Deployment Notes
+## Production Notes
 
-- Deploy `call_handler.py` and `server.py` as separate services (Railway, Render, EC2, etc.).
-- Set `CALL_HANDLER_URL` in `server.py`'s env to the public URL of `call_handler`.
-- Use a process manager (systemd, supervisord, or Docker) — both services must stay up.
-- Twilio requires a publicly accessible HTTPS URL for both webhooks.
-- Set Supabase RLS policies appropriately if exposing the anon key in the frontend.
-- `SUPABASE_SERVICE_ROLE_KEY` is backend-only — never expose it to the frontend.
+- Deploy `voice_agent.py` and `call_handler.py` as separate services (Railway, Render, EC2, Docker).
+- Set `CALL_HANDLER_URL` to `call_handler`'s public URL.
+- Both services require public HTTPS endpoints for Telnyx webhooks.
+- `SUPABASE_SERVICE_ROLE_KEY` is backend-only — never expose to frontend.
+- Set Supabase RLS policies before exposing the anon key in the frontend.
+- Use a process manager (systemd, supervisord, or Docker) — both services must stay running.

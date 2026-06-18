@@ -1,17 +1,19 @@
 """
 call_handler.py  —  FastAPI + Supabase
-Twilio webhook receiver + transcription + lead extraction + Make.com trigger
+Telnyx webhook receiver + transcription + lead extraction + N8N trigger
 
 Run:
   pip install fastapi uvicorn httpx groq python-dotenv supabase
   uvicorn call_handler:app --host 0.0.0.0 --port 8000 --reload
 
 Upgrades vs v3.2.0:
-  8. source field written to calls table         [Top Sources chart support]
-  9. name extracted from transcript + saved      [Leads page name column]
-  10. lifespan replaces deprecated on_event()   [FastAPI v0.93+ clean startup]
-  11. system_prompt fetched from agent_config DB [no more hardcoded prompt]
-  12. agent_config cache with TTL=5min           [prompt edits apply fast]
+  8.  source field written to calls table         [Top Sources chart support]
+  9.  name extracted from transcript + saved      [Leads page name column]
+  10. lifespan replaces deprecated on_event()    [FastAPI v0.93+ clean startup]
+  11. system_prompt fetched from agent_config DB  [no more hardcoded prompt]
+  12. agent_config cache with TTL=5min            [prompt edits apply fast]
+  13. Telnyx webhook replaces Twilio              [POST /telnyx-webhook]
+  14. lead_name exposed in /api/config            [server.py recovery memory]
 """
 
 import asyncio
@@ -26,7 +28,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from groq import AsyncGroq
 from supabase import create_client, Client
 
@@ -34,11 +36,12 @@ from supabase import create_client, Client
 
 load_dotenv()
 
-DEEPGRAM_API_KEY      = os.getenv("DEEPGRAM_API_KEY", "")
-GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "") 
-N8N_WEBHOOK_URL       = os.getenv("N8N_WEBHOOK_URL", "")
-SUPABASE_URL          = os.getenv("SUPABASE_URL", "")
+DEEPGRAM_API_KEY          = os.getenv("DEEPGRAM_API_KEY", "")
+GROQ_API_KEY              = os.getenv("GROQ_API_KEY", "")
+N8N_WEBHOOK_URL           = os.getenv("N8N_WEBHOOK_URL", "")
+SUPABASE_URL              = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+TELNYX_API_KEY            = os.getenv("TELNYX_API_KEY", "")   # UPGRADE #13
 
 for name, val in [
     ("DEEPGRAM_API_KEY",          DEEPGRAM_API_KEY),
@@ -50,17 +53,14 @@ for name, val in [
         raise ValueError(f"{name} missing from .env")
 
 groq_client: AsyncGroq       = AsyncGroq(api_key=GROQ_API_KEY)
-supabase:    Optional[Client] = None  # initialised in lifespan
+supabase:    Optional[Client] = None
 
 # ── UPGRADE #12: agent_config cache ──────────────────────────
-# Fetched once at startup, refreshed every TTL seconds so prompt
-# edits from the dashboard apply without a server restart.
 
-_CONFIG_CACHE: Dict[str, str] = {}
+_CONFIG_CACHE:    Dict[str, str] = {}
 _CONFIG_CACHE_TS: float = 0.0
-_CONFIG_TTL: float = 300.0  # 5 minutes
+_CONFIG_TTL:      float = 300.0  # 5 minutes
 
-# Fallback prompt — only used if agent_config table is empty/unreachable
 _DEFAULT_SYSTEM_PROMPT = """
 You are a friendly and confident sales caller from Inbox Infotech.
 You are speaking naturally on a real-time phone call.
@@ -85,7 +85,6 @@ Understand customer needs and guide the conversation naturally.
 
 
 def _fetch_agent_config_sync() -> Dict[str, str]:
-    """Fetch all agent_config rows synchronously (called via to_thread)."""
     rows = (
         _get_supabase()
         .table("agent_config")
@@ -97,12 +96,11 @@ def _fetch_agent_config_sync() -> Dict[str, str]:
 
 
 async def get_agent_config(force: bool = False) -> Dict[str, str]:
-    """Return cached agent_config, refreshing if stale or forced."""
     global _CONFIG_CACHE, _CONFIG_CACHE_TS
     now = time.monotonic()
     if force or not _CONFIG_CACHE or (now - _CONFIG_CACHE_TS) > _CONFIG_TTL:
         try:
-            _CONFIG_CACHE = await asyncio.to_thread(_fetch_agent_config_sync)
+            _CONFIG_CACHE    = await asyncio.to_thread(_fetch_agent_config_sync)
             _CONFIG_CACHE_TS = now
             print(f"[config] refreshed — {len(_CONFIG_CACHE)} keys")
         except Exception as e:
@@ -111,28 +109,23 @@ async def get_agent_config(force: bool = False) -> Dict[str, str]:
 
 
 async def get_system_prompt() -> str:
-    """Return system_prompt from DB, falling back to hardcoded default."""
-    cfg = await get_agent_config()
+    cfg    = await get_agent_config()
     prompt = cfg.get("system_prompt", "").strip()
     if not prompt:
         print("[config] system_prompt not in DB — using default")
         return _DEFAULT_SYSTEM_PROMPT
     return prompt
 
-
-# ── UPGRADE #10: lifespan replaces deprecated @on_event ───────
+# ── lifespan ──────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── startup ──
     global supabase
     supabase = create_client(
         supabase_url=SUPABASE_URL,
         supabase_key=SUPABASE_SERVICE_ROLE_KEY,
     )
     print("[startup] Supabase client ready")
-
-    # Pre-warm config cache so first call has the prompt immediately
     try:
         await get_agent_config(force=True)
         prompt_preview = (await get_system_prompt())[:80].replace("\n", " ")
@@ -140,18 +133,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[startup] config pre-warm failed: {e}")
 
-    yield  # app runs
-
-    # ── shutdown ──
+    yield
     print("[shutdown] clean exit")
-
 
 # ── app ───────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Inbox Infotech — Call Handler",
-    version="3.3.0",
-    lifespan=lifespan,         # UPGRADE #10
+    version="3.4.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -161,7 +151,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ── Supabase guard ────────────────────────────────────────────
 
 def _get_supabase() -> Client:
@@ -169,11 +158,131 @@ def _get_supabase() -> Client:
         raise RuntimeError("Supabase client not initialised yet")
     return supabase
 
+# ═══════════════════════════════════════════════════════════════
+# UPGRADE #13: Telnyx webhook  POST /telnyx-webhook
+# Replaces /twilio-webhook.
+#
+# Telnyx sends call.completed events via HTTP webhooks (JSON body).
+# Recording URL comes from a separate call.recording.saved event
+# or the Telnyx Call Control API; here we handle both patterns:
+#   a) call.recording.saved  → has recording_url directly
+#   b) call.completed        → fetch recording from Telnyx API
+# ═══════════════════════════════════════════════════════════════
 
-# ── POST /twilio-webhook ──────────────────────────────────────
+async def _fetch_telnyx_recording(call_control_id: str) -> str:
+    """
+    Query Telnyx API for the recording URL of a completed call.
+    Returns empty string if not found or API key missing.
+    """
+    if not TELNYX_API_KEY:
+        print("[telnyx] TELNYX_API_KEY not set — cannot fetch recording")
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://api.telnyx.com/v2/recordings?filter[call_control_id]={call_control_id}",
+                headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                if data:
+                    url = data[0].get("download_urls", {}).get("mp3", "")
+                    print(f"[telnyx] recording URL fetched: {url[:60]}…")
+                    return url
+            print(f"[telnyx] recording fetch {resp.status_code}: {resp.text[:120]}")
+    except Exception as e:
+        print(f"[telnyx] recording fetch error: {e}")
+    return ""
 
+
+@app.post("/telnyx-webhook")
+async def telnyx_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Handles two Telnyx event types:
+      - call.recording.saved  → recording URL available immediately
+      - call.completed        → fetch recording via API
+    All other events return 200 immediately (Telnyx requires ACK).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "bad_request"}, status_code=400)
+
+    data      = body.get("data", {})
+    event_type = data.get("event_type", "")
+    payload   = data.get("payload", {})
+
+    call_control_id = payload.get("call_control_id", "")
+    call_leg_id     = payload.get("call_leg_id", call_control_id)
+
+    # Source tag: N8N sets X-Lead-Source header when triggering outbound calls
+    source = request.headers.get("X-Lead-Source", "Outbound Call")
+
+    print(f"[telnyx-webhook] event={event_type} call_control_id={call_control_id}")
+
+    # ── call.recording.saved ──────────────────────────────────
+    if event_type == "call.recording.saved":
+        recording_url = (
+            payload.get("recording_urls", {}).get("mp3", "")
+            or payload.get("public_recording_urls", {}).get("mp3", "")
+        )
+        if not recording_url:
+            return JSONResponse({"status": "skipped", "reason": "no recording url"})
+
+        from_number  = payload.get("from", "")
+        to_number    = payload.get("to", "")
+        duration_sec = int(payload.get("duration_secs", 0))
+
+        call_meta = {
+            "call_sid":      call_control_id,
+            "from_number":   from_number,
+            "to_number":     to_number,
+            "duration_sec":  duration_sec,
+            "recording_url": recording_url,
+            "source":        source,
+            "received_at":   datetime.utcnow().isoformat(),
+        }
+        background_tasks.add_task(
+            process_recording_pipeline, call_control_id, recording_url, call_meta
+        )
+        print(f"[telnyx-webhook] queued pipeline for {call_control_id}")
+        return JSONResponse({"status": "received", "call_control_id": call_control_id})
+
+    # ── call.completed ────────────────────────────────────────
+    elif event_type == "call.completed":
+        from_number  = payload.get("from", "")
+        to_number    = payload.get("to", "")
+        duration_sec = int(payload.get("duration_secs", 0))
+
+        async def _delayed_pipeline():
+            # Small delay — Telnyx may not have processed recording yet
+            await asyncio.sleep(5)
+            recording_url = await _fetch_telnyx_recording(call_control_id)
+            if not recording_url:
+                print(f"[telnyx-webhook] no recording for {call_control_id} — skipping pipeline")
+                return
+            call_meta = {
+                "call_sid":      call_control_id,
+                "from_number":   from_number,
+                "to_number":     to_number,
+                "duration_sec":  duration_sec,
+                "recording_url": recording_url,
+                "source":        source,
+                "received_at":   datetime.utcnow().isoformat(),
+            }
+            await process_recording_pipeline(call_control_id, recording_url, call_meta)
+
+        background_tasks.add_task(_delayed_pipeline)
+        return JSONResponse({"status": "received", "call_control_id": call_control_id})
+
+    # ── all other events: ACK and ignore ─────────────────────
+    return JSONResponse({"status": "ok", "event": event_type})
+
+
+# ── Keep /twilio-webhook alive for legacy callers ─────────────
 @app.post("/twilio-webhook")
-async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
+async def twilio_webhook_legacy(request: Request, background_tasks: BackgroundTasks):
+    """Backwards-compat shim — delegates to same pipeline."""
     form = await request.form()
     body = dict(form)
 
@@ -183,20 +292,14 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
     duration      = int(body.get("CallDuration", 0))
     from_number   = body.get("From", "")
     to_number     = body.get("To", "")
+    source        = request.headers.get("X-Lead-Source", "Inbound Call")
 
-    # UPGRADE #8: tag source — Twilio webhook = inbound or Make.com-triggered.
-    # N8N passes X-leads-source header when it triggers the call;
-    # plain Twilio callbacks won't have it so we default to 'Inbound Call'.
-    source = request.headers.get("X-Lead-Source", "Inbound Call")
-
-    print(f"[twilio] call_sid={call_sid} status={status} duration={duration}s source={source}")
+    print(f"[twilio-legacy] call_sid={call_sid} status={status}")
 
     if status != "completed":
         return JSONResponse({"status": "skipped", "reason": f"status={status}"})
-    if not call_sid:
-        return JSONResponse({"status": "skipped", "reason": "missing CallSid"})
-    if not recording_url:
-        return JSONResponse({"status": "skipped", "reason": "missing RecordingUrl"})
+    if not call_sid or not recording_url:
+        return JSONResponse({"status": "skipped", "reason": "missing fields"})
 
     if not recording_url.endswith(".mp3"):
         recording_url += ".mp3"
@@ -207,18 +310,17 @@ async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
         "to_number":     to_number,
         "duration_sec":  duration,
         "recording_url": recording_url,
-        "source":        source,          # UPGRADE #8
+        "source":        source,
         "received_at":   datetime.utcnow().isoformat(),
     }
-
     background_tasks.add_task(
         process_recording_pipeline, call_sid, recording_url, call_meta
     )
-    print(f"[twilio] queued pipeline for {call_sid}")
     return JSONResponse({"status": "received", "call_sid": call_sid})
 
-
-# ── transcription ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# TRANSCRIPTION
+# ═══════════════════════════════════════════════════════════════
 
 async def transcribe_recording(audio_bytes: bytes) -> str:
     print(f"[transcribe] sending {len(audio_bytes):,} bytes")
@@ -276,10 +378,10 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
     print(f"[transcribe] done — {len(lines)} turns")
     return transcript
 
+# ═══════════════════════════════════════════════════════════════
+# EXTRACTION
+# ═══════════════════════════════════════════════════════════════
 
-# ── extraction ────────────────────────────────────────────────
-
-# UPGRADE #9: added "name" field to extraction prompt + schema
 EXTRACTION_PROMPT = """
 You are an expert sales analyst at Inbox Infotech.
 Analyze this call transcript and extract structured lead information.
@@ -295,6 +397,7 @@ Transcript:
 Return ONLY valid JSON with this exact structure:
 {{
     "name": "",
+    "company": "",
     "pain_points": [],
     "budget": "",
     "requirements": [],
@@ -311,6 +414,7 @@ Return ONLY valid JSON with this exact structure:
 
 Field notes:
 - name: customer's first name if mentioned, else empty string ""
+- company: customer's company name if mentioned, else empty string ""
 
 Scoring rules — apply strictly:
 HOT  (score 8-10): clear interest + budget indicator + decision maker + urgency
@@ -320,6 +424,7 @@ COLD (score 1-3) : no interest, declined, hung up, wrong number, voicemail
 
 _COLD_FALLBACK: Dict[str, Any] = {
     "name":               "",
+    "company":            "",
     "pain_points":        [],
     "budget":             "not mentioned",
     "requirements":       [],
@@ -353,8 +458,8 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
 
         extracted = json.loads(response.choices[0].message.content)
 
-        # Defaults + validation
         extracted.setdefault("name", "")
+        extracted.setdefault("company", "")
         extracted.setdefault("pain_points", [])
         extracted.setdefault("requirements", [])
         extracted.setdefault("interested_services", [])
@@ -363,19 +468,23 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
         extracted["lead_score"] = max(1, min(10, int(extracted["lead_score"])))
         cat = extracted["lead_category"].upper()
         extracted["lead_category"] = cat if cat in ("HOT", "WARM", "COLD") else "COLD"
-        # Sanitise name — strip whitespace, never let LLM hallucinate "Unknown"
+
         name = str(extracted.get("name", "")).strip()
         extracted["name"] = name if name.lower() not in ("", "unknown", "n/a", "none") else ""
 
-        print(f"[extract] {call_sid} → {extracted['lead_category']} score={extracted['lead_score']} name='{extracted['name']}'")
+        company = str(extracted.get("company", "")).strip()
+        extracted["company"] = company if company.lower() not in ("", "unknown", "n/a", "none") else ""
+
+        print(f"[extract] {call_sid} → {extracted['lead_category']} score={extracted['lead_score']} name='{extracted['name']}' company='{extracted['company']}'")
         return extracted
 
     except Exception as e:
         print(f"[extract] failed: {e}")
         return {**_COLD_FALLBACK, "summary": "Extraction failed.", "next_action": "Manual review required."}
 
-
-# ── Supabase storage ──────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# SUPABASE STORAGE
+# ═══════════════════════════════════════════════════════════════
 
 def _save_record_sync(row: Dict[str, Any]) -> None:
     _get_supabase().table("calls").upsert(row).execute()
@@ -395,10 +504,9 @@ async def save_record(record: Dict[str, Any]) -> None:
         "lead_score":    extracted.get("lead_score", 1),
         "extracted":     extracted,
         "recording_url": meta.get("recording_url", ""),
-        # UPGRADE #8: persist source so dashboard Top Sources chart works
         "source":        meta.get("source", "Unknown"),
-        # UPGRADE #9: top-level name column for fast queries / display
         "name":          extracted.get("name", ""),
+        "company":       extracted.get("company", ""),   # UPGRADE #14 side-effect
     }
 
     try:
@@ -442,8 +550,9 @@ def _load_transcript_sync(call_sid: str) -> Optional[Dict[str, Any]]:
     )
     return res.data
 
-
-# ── Make.com HOT lead trigger ─────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# N8N HOT LEAD TRIGGER
+# ═══════════════════════════════════════════════════════════════
 
 async def trigger_hot_lead_workflow(
     call_sid:  str,
@@ -457,10 +566,11 @@ async def trigger_hot_lead_workflow(
     payload = {
         "call_sid":            call_sid,
         "to_number":           meta.get("to_number"),
-        "name":                extracted.get("name", ""),   # UPGRADE #9
+        "name":                extracted.get("name", ""),
+        "company":             extracted.get("company", ""),
         "duration_sec":        meta.get("duration_sec"),
         "recording_url":       meta.get("recording_url"),
-        "source":              meta.get("source", "Unknown"),  # UPGRADE #8
+        "source":              meta.get("source", "Unknown"),
         "lead_category":       extracted.get("lead_category"),
         "lead_score":          extracted.get("lead_score"),
         "intent_level":        extracted.get("intent_level"),
@@ -480,8 +590,9 @@ async def trigger_hot_lead_workflow(
     except Exception as e:
         print(f"[n8n] failed: {e}")
 
-
-# ── pipeline ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# PIPELINE
+# ═══════════════════════════════════════════════════════════════
 
 async def process_recording_pipeline(
     call_sid:      str,
@@ -516,8 +627,9 @@ async def process_recording_pipeline(
 
     print(f"[pipeline] completed {call_sid}")
 
-
-# ── GET /api/leads ────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
 
 @app.get("/api/leads")
 async def get_leads(category: Optional[str] = None, limit: int = 100):
@@ -532,8 +644,9 @@ async def get_leads(category: Optional[str] = None, limit: int = 100):
             "timestamp":           r.get("created_at"),
             "from_number":         r.get("from_number"),
             "to_number":           r.get("to_number"),
-            "name":                r.get("name", ""),                          # UPGRADE #9
-            "source":              r.get("source", "Unknown"),                 # UPGRADE #8
+            "name":                r.get("name", ""),
+            "company":             r.get("company", ""),
+            "source":              r.get("source", "Unknown"),
             "duration_sec":        r.get("duration_sec"),
             "lead_category":       r.get("lead_category", "COLD"),
             "lead_score":          r.get("lead_score", 1),
@@ -550,8 +663,6 @@ async def get_leads(category: Optional[str] = None, limit: int = 100):
     return JSONResponse({"total": len(leads), "leads": leads})
 
 
-# ── GET /api/stats ────────────────────────────────────────────
-
 @app.get("/api/stats")
 async def get_stats():
     try:
@@ -559,10 +670,10 @@ async def get_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    total = len(rows)
-    hot   = sum(1 for r in rows if r.get("lead_category") == "HOT")
-    warm  = sum(1 for r in rows if r.get("lead_category") == "WARM")
-    cold  = sum(1 for r in rows if r.get("lead_category") == "COLD")
+    total     = len(rows)
+    hot       = sum(1 for r in rows if r.get("lead_category") == "HOT")
+    warm      = sum(1 for r in rows if r.get("lead_category") == "WARM")
+    cold      = sum(1 for r in rows if r.get("lead_category") == "COLD")
     avg_score = (sum(r.get("lead_score", 0) for r in rows) / total if total else 0)
 
     return JSONResponse({
@@ -574,8 +685,6 @@ async def get_stats():
         "conversion_rate": round(hot / total * 100, 1) if total else 0,
     })
 
-
-# ── GET /api/transcript/{call_sid} ────────────────────────────
 
 @app.get("/api/transcript/{call_sid}")
 async def get_transcript(call_sid: str):
@@ -599,31 +708,37 @@ async def get_transcript(call_sid: str):
     return JSONResponse({"call_sid": call_sid, "transcript": parsed})
 
 
-# ── GET /api/config ───────────────────────────────────────────
-# Exposed so server.py can fetch the prompt via HTTP if preferred
-# (alternative to a shared Supabase client in that process).
+# ═══════════════════════════════════════════════════════════════
+# UPGRADE #14: /api/config — expose lead_name for server.py
+# ═══════════════════════════════════════════════════════════════
 
 @app.get("/api/config")
 async def get_config():
     cfg = await get_agent_config()
-    # Never expose service role key or internal values — only agent config
+
+    # Keys safe to expose to server.py (never expose service role creds)
     safe_keys = {
         "system_prompt", "agent_name", "company_name",
         "calendly_link", "followup_delay", "notification_email",
+        "lead_name",    # UPGRADE #14: server.py uses this for greeting + recovery memory
     }
-    return JSONResponse({k: v for k, v in cfg.items() if k in safe_keys})
+    filtered = {k: v for k, v in cfg.items() if k in safe_keys}
 
+    # lead_name fallback: if not in agent_config table, check env
+    # (useful when set per-campaign via environment variable)
+    if "lead_name" not in filtered:
+        env_lead = os.getenv("LEAD_NAME", "").strip()
+        if env_lead:
+            filtered["lead_name"] = env_lead
 
-# ── POST /api/config/refresh ──────────────────────────────────
-# server.py calls this to force-bust the cache after a prompt save.
+    return JSONResponse(filtered)
+
 
 @app.post("/api/config/refresh")
 async def refresh_config():
     await get_agent_config(force=True)
     return JSONResponse({"status": "ok", "keys": list(_CONFIG_CACHE.keys())})
 
-
-# ── GET /health ───────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -643,7 +758,6 @@ async def health():
         "config_keys_loaded": list(cfg.keys()),
         "timestamp":          datetime.utcnow().isoformat(),
     })
-
 
 # ── entrypoint ────────────────────────────────────────────────
 
