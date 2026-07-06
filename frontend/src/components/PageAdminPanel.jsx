@@ -8,12 +8,36 @@ import {
 
 // ─── schema ───────────────────────────────────────────────────────────────────
 
+// Every table the app writes to, grouped for the sidebar. If a table
+// exists in Supabase but isn't listed here, it won't show up in the panel —
+// keep this in sync with migration_multi_agent.sql.
+const CATEGORIES = [
+  { label: 'Agents',       tables: ['agents', 'agent_config', 'prompt_versions'] },
+  { label: 'Leads & Calls', tables: ['calls', 'lead_notes'] },
+  { label: 'Forms',        tables: ['forms', 'form_submissions', 'form_send_log'] },
+]
+
 const TABLES = {
+  agents: {
+    pk: 'agent_id',
+    readonly: ['created_at', 'updated_at'],
+    columns: ['agent_id', 'name', 'phone_number', 'is_active', 'created_at', 'updated_at'],
+    types: { is_active: 'boolean' },
+  },
   agent_config: {
-    pk: 'key',
+    // composite key — one agent can have many keys (system_prompt, etc),
+    // and the same key ('system_prompt') repeats across agents, so
+    // uniqueness is (agent_id, key) together, not either column alone.
+    pk: ['agent_id', 'key'],
     readonly: ['updated_at'],
-    columns: ['key', 'value', 'updated_at'],
+    columns: ['agent_id', 'key', 'value', 'updated_at'],
     types: { key: 'text', value: 'text', updated_at: 'timestamptz' },
+  },
+  prompt_versions: {
+    pk: 'id',
+    readonly: ['id', 'created_at'],
+    columns: ['id', 'agent_id', 'prompt_key', 'prompt_value', 'rollback_note', 'created_at'],
+    types: {},
   },
   calls: {
     pk: 'id',
@@ -21,14 +45,25 @@ const TABLES = {
     columns: [
       'id', 'call_sid', 'from_number', 'to_number', 'duration_sec',
       'transcript', 'lead_category', 'lead_score', 'extracted',
-      'recording_url', 'source', 'last_contacted_at', 'created_at',
+      'recording_url', 'source', 'name', 'company', 'agent_id',
+      'live_facts', 'live_outcome', 'live_history', 'live_updated_at',
+      'last_contacted_at', 'created_at',
     ],
-    types: { extracted: 'jsonb', duration_sec: 'number', lead_score: 'number' },
+    types: {
+      extracted: 'jsonb', live_facts: 'jsonb', live_history: 'jsonb',
+      duration_sec: 'number', lead_score: 'number',
+    },
   },
   lead_notes: {
     pk: 'id',
     readonly: ['id', 'created_at'],
     columns: ['id', 'call_sid', 'note', 'author', 'created_at'],
+    types: {},
+  },
+  forms: {
+    pk: 'id',
+    readonly: ['id', 'created_at'],
+    columns: ['id', 'form_url', 'label', 'gmail', 'created_by', 'last_used_at', 'created_at'],
     types: {},
   },
   form_submissions: {
@@ -37,15 +72,15 @@ const TABLES = {
     columns: ['id', 'name', 'to_number', 'email', 'service_requirements', 'budget', 'timeline', 'submitted_at'],
     types: {},
   },
-  prompt_versions: {
+  form_send_log: {
     pk: 'id',
-    readonly: ['id', 'created_at'],
-    columns: ['id', 'prompt_key', 'prompt_value', 'rollback_note', 'created_at'],
-    types: {},
+    readonly: ['id', 'sent_at'],
+    columns: ['id', 'lead_name', 'lead_email', 'sent_by', 'form_url', 'sent_at', 'response_received'],
+    types: { response_received: 'boolean' },
   },
 }
 
-const GLOBAL_READONLY = new Set(['id', 'created_at', 'updated_at', 'submitted_at'])
+const GLOBAL_READONLY = new Set(['id', 'created_at', 'updated_at', 'submitted_at', 'sent_at'])
 const PAGE_SIZE = 20
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -61,6 +96,10 @@ function isJsonb(tableName, col) {
 
 function isNumber(tableName, col) {
   return TABLES[tableName]?.types?.[col] === 'number'
+}
+
+function isBoolean(tableName, col) {
+  return TABLES[tableName]?.types?.[col] === 'boolean'
 }
 
 function displayVal(v) {
@@ -84,7 +123,7 @@ const S = {
     minHeight: 520,
   },
   sidebar: {
-    width: 190,
+    width: 200,
     flexShrink: 0,
     background: 'var(--bg2)',
     border: '0.5px solid var(--border)',
@@ -92,7 +131,8 @@ const S = {
     padding: 10,
     display: 'flex',
     flexDirection: 'column',
-    gap: 6,
+    gap: 2,
+    overflowY: 'auto',
   },
   sidebarLabel: {
     fontSize: 10,
@@ -102,9 +142,30 @@ const S = {
     letterSpacing: 0.8,
     padding: '4px 6px 10px',
   },
+  categoryLabel: {
+    fontSize: 9,
+    fontWeight: 700,
+    color: 'var(--text3)',
+    textTransform: 'uppercase',
+    letterSpacing: 0.7,
+    padding: '12px 6px 4px',
+  },
+  countBadge: (active) => ({
+    fontSize: 10,
+    fontWeight: 600,
+    padding: '1px 6px',
+    borderRadius: 20,
+    background: active ? 'rgba(255,255,255,0.2)' : 'var(--bg3)',
+    color: active ? '#fff' : 'var(--text3)',
+    flexShrink: 0,
+  }),
   tableBtn: (active) => ({
     width: '100%',
     padding: '9px 11px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
     textAlign: 'left',
     background: active ? 'var(--accent)' : 'transparent',
     border: active ? 'none' : '0.5px solid transparent',
@@ -115,8 +176,6 @@ const S = {
     cursor: 'pointer',
     transition: 'all .15s',
     whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
   }),
   main: {
     flex: 1,
@@ -461,7 +520,7 @@ function CellEditor({ value, jsonb, onSave, onCancel }) {
 // ─── main component ───────────────────────────────────────────────────────────
 
 export default function PageAdminPanel({ supabase, showToast }) {
-  const [table, setTable]         = useState('agent_config')
+  const [table, setTable]         = useState('agents')
   const [rows, setRows]           = useState([])
   const [loading, setLoading]     = useState(false)
   const [error, setError]         = useState('')
@@ -472,6 +531,19 @@ export default function PageAdminPanel({ supabase, showToast }) {
   const [showInsert, setShowInsert] = useState(false)
   const [insertData, setInsertData] = useState({})
   const [insertErrors, setInsertErrors] = useState({})
+  const [counts, setCounts] = useState({})   // { tableName: rowCount } — sidebar badges
+
+  // ── row counts for every table, shown as sidebar badges ─────────────────────
+
+  const refreshCount = useCallback(async (t) => {
+    const { count } = await supabase.from(t).select('*', { count: 'exact', head: true })
+    setCounts(prev => ({ ...prev, [t]: count ?? 0 }))
+  }, [supabase])
+
+  useEffect(() => {
+    Object.keys(TABLES).forEach(t => { refreshCount(t) })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // ── fetch ──────────────────────────────────────────────────────────────────
 
@@ -525,6 +597,16 @@ export default function PageAdminPanel({ supabase, showToast }) {
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const pageRows   = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
+  // pk can be a single column name ('id') or an array of columns
+  // (e.g. ['agent_id', 'key'] for agent_config, which is keyed per-agent)
+  // — this builds the right .match() filter either way.
+  const pkMatch = (row) => {
+    const cols = Array.isArray(pk) ? pk : [pk]
+    const m = {}
+    cols.forEach(c => { m[c] = row[c] })
+    return m
+  }
+
   // ── save cell ─────────────────────────────────────────────────────────────
 
   const saveCell = async (row, col, rawVal) => {
@@ -533,11 +615,12 @@ export default function PageAdminPanel({ supabase, showToast }) {
     try {
       if (isJsonb(table, col))   value = JSON.parse(rawVal)
       if (isNumber(table, col))  value = Number(rawVal)
+      if (isBoolean(table, col)) value = rawVal === 'true' || rawVal === true
 
       const { error: e } = await supabase
         .from(table)
         .update({ [col]: value })
-        .eq(pk, row[pk])
+        .match(pkMatch(row))
 
       if (e) throw e
       showToast?.('Saved ✓')
@@ -552,10 +635,11 @@ export default function PageAdminPanel({ supabase, showToast }) {
   const deleteRow = async (row) => {
     setDeleteConfirm(null)
     try {
-      const { error: e } = await supabase.from(table).delete().eq(pk, row[pk])
+      const { error: e } = await supabase.from(table).delete().match(pkMatch(row))
       if (e) throw e
       showToast?.('Row deleted')
       loadRows()
+      refreshCount(table)
     } catch (e) {
       setError(e.message)
     }
@@ -576,6 +660,8 @@ export default function PageAdminPanel({ supabase, showToast }) {
           try { payload[c] = JSON.parse(v) } catch { errs[c] = 'Invalid JSON' }
         } else if (isNumber(table, c)) {
           payload[c] = Number(v)
+        } else if (isBoolean(table, c)) {
+          payload[c] = v === 'true' || v === true
         } else {
           payload[c] = v
         }
@@ -591,6 +677,7 @@ export default function PageAdminPanel({ supabase, showToast }) {
       setInsertData({})
       setInsertErrors({})
       loadRows()
+      refreshCount(table)
     } catch (e) {
       setError(e.message)
     }
@@ -621,12 +708,18 @@ export default function PageAdminPanel({ supabase, showToast }) {
 
       {/* sidebar */}
       <div style={S.sidebar}>
-        <div style={S.sidebarLabel}><Database size={11} style={{ marginRight: 4, verticalAlign: 'middle' }} />Tables</div>
-        {Object.keys(TABLES).map(t => (
-          <button key={t} style={S.tableBtn(t === table)}
-            onClick={() => { setTable(t); setSearch(''); setShowInsert(false); setInsertData({}) }}>
-            {t}
-          </button>
+        <div style={S.sidebarLabel}><Database size={11} style={{ marginRight: 4, verticalAlign: 'middle' }} />Database</div>
+        {CATEGORIES.map(cat => (
+          <div key={cat.label}>
+            <div style={S.categoryLabel}>{cat.label}</div>
+            {cat.tables.map(t => (
+              <button key={t} style={S.tableBtn(t === table)}
+                onClick={() => { setTable(t); setSearch(''); setShowInsert(false); setInsertData({}) }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{t}</span>
+                <span style={S.countBadge(t === table)}>{counts[t] ?? '·'}</span>
+              </button>
+            ))}
+          </div>
         ))}
       </div>
 
@@ -653,7 +746,7 @@ export default function PageAdminPanel({ supabase, showToast }) {
               style={S.searchInput}
             />
           </div>
-          <button style={S.iconBtn(false)} onClick={loadRows} title="Refresh">
+          <button style={S.iconBtn(false)} onClick={() => { loadRows(); refreshCount(table) }} title="Refresh">
             <RefreshCw size={13} />
           </button>
           <button style={S.iconBtn(false)} onClick={exportCSV} title="Export CSV" disabled={!filtered.length}>
@@ -694,6 +787,15 @@ export default function PageAdminPanel({ supabase, showToast }) {
                       placeholder='{"key":"value"}'
                       style={{ ...S.insertInput, minHeight: 60, fontFamily: 'monospace', fontSize: 11, resize: 'vertical' }}
                     />
+                  ) : isBoolean(table, col) ? (
+                    <select
+                      value={insertData[col] ?? 'true'}
+                      onChange={e => setInsertData(p => ({ ...p, [col]: e.target.value }))}
+                      style={S.insertInput}
+                    >
+                      <option value="true">true</option>
+                      <option value="false">false</option>
+                    </select>
                   ) : (
                     <input
                       type={isNumber(table, col) ? 'number' : 'text'}

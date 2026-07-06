@@ -10,7 +10,8 @@ import {
   PhoneCall, Copy, CheckCircle2, AlertCircle, Radio, Search,
   Clock, Activity, BarChart2, FileText, Download, X, History,
   ClipboardList, Settings, Zap, MessageSquare, Calendar,
-  Handshake, StickyNote, ChevronDown, Send, Save, ArrowLeftRight
+  Handshake, StickyNote, ChevronDown, Send, Save, ArrowLeftRight,
+  Plus, Trash2
 } from 'lucide-react'
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
@@ -1481,56 +1482,127 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
 }
 // ══════════════════════════════════════════════════════════════
 // PAGE: ANALYTICS
+// (self-contained — uses only helpers/icons already in this file:
+//  CATEGORY_COLOR, SCORE_COLOR, buildWeeklyData, CheckCircle2, styles.filters)
 // ══════════════════════════════════════════════════════════════
-function PageAnalytics({ records, stats, loading }) {
-  const total    = stats?.total_calls ?? records.length
-  const hot      = stats?.hot  ?? records.filter(r => r.lead_category === 'HOT').length
-  const warm     = stats?.warm ?? records.filter(r => r.lead_category === 'WARM').length
-  const cold     = stats?.cold ?? records.filter(r => r.lead_category === 'COLD').length
-  const convRate = stats?.conversion_rate ?? (total ? Math.round(hot / total * 100) : 0)
-  const avgScore = stats?.avg_lead_score  ?? (records.length ? (records.reduce((s, r) => s + (r.lead_score || 0), 0) / records.length).toFixed(1) : 0)
 
-  const durationData = ['HOT','WARM','COLD'].map(cat => {
-    const rows = records.filter(r => r.lead_category === cat && r.duration_sec)
-    const avg  = rows.length ? Math.round(rows.reduce((s, r) => s + r.duration_sec, 0) / rows.length) : 0
-    return { category: cat, avg_sec: avg, avg_min: +(avg / 60).toFixed(1) }
-  })
+// ── period options + bucketing (local to Analytics page) ──────
+const ANALYTICS_PERIODS = [
+  { id: 'weekly',  label: 'Weekly'  },
+  { id: 'monthly', label: 'Monthly' },
+  { id: 'yearly',  label: 'Yearly'  },
+]
+const DOW_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
 
-  const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
-  const dowData = DOW.map((d, i) => ({
-    day: d,
-    calls: records.filter(r => r.timestamp && new Date(r.timestamp).getDay() === i).length,
-  }))
+function getAnalyticsPeriodConfig(period) {
+  const now = new Date()
+  if (period === 'weekly') {
+    const cutoff = new Date(now); cutoff.setDate(cutoff.getDate() - 7)
+    return { cutoff, bucketKey: d => d.toLocaleDateString('en-IN', { weekday: 'short' }), order: DOW_LABELS }
+  }
+  if (period === 'yearly') {
+    const cutoff = new Date(now); cutoff.setFullYear(cutoff.getFullYear() - 1)
+    return { cutoff, bucketKey: d => d.toLocaleDateString('en-IN', { month: 'short' }), order: ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] }
+  }
+  const cutoff = new Date(now); cutoff.setDate(cutoff.getDate() - 30)
+  return { cutoff, bucketKey: d => d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }), order: null }
+}
 
-  const serviceMap = {}
+function filterRecordsByPeriod(records, period) {
+  const { cutoff } = getAnalyticsPeriodConfig(period)
+  return records.filter(r => r.timestamp && new Date(r.timestamp) >= cutoff)
+}
+
+function buildScoreSeries(records, period) {
+  const { bucketKey, order } = getAnalyticsPeriodConfig(period)
+  const map = {}
   records.forEach(r => {
-    (r.interested_services || []).forEach(s => { serviceMap[s] = (serviceMap[s] || 0) + 1 })
+    if (!r.timestamp) return
+    const key = bucketKey(new Date(r.timestamp))
+    if (!map[key]) map[key] = { date: key, scoreSum: 0, scoreN: 0 }
+    map[key].scoreSum += (r.lead_score || 0)
+    map[key].scoreN++
   })
-  const serviceData = Object.entries(serviceMap).sort((a,b) => b[1]-a[1]).slice(0,8).map(([name, count]) => ({ name, count }))
+  const toRow = key => {
+    const m = map[key]
+    return { date: key, avg_score: m && m.scoreN ? +(m.scoreSum / m.scoreN).toFixed(1) : 0 }
+  }
+  if (order) return order.map(toRow)
+  return Object.keys(map)
+    .map(toRow)
+    .sort((a, b) => new Date(`1 ${a.date}`) - new Date(`1 ${b.date}`))
+    .slice(-30)
+}
 
-  const scoreOverTime = buildWeeklyData(records).map(d => ({
-    ...d,
-    avg_score: records.filter(r => {
-      const k = r.timestamp ? new Date(r.timestamp).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }) : ''
-      return k === d.date
-    }).reduce((s, r, _, a) => s + (r.lead_score || 0) / a.length, 0).toFixed(1),
+// ── dropdown — reuses existing .filters / .filterBtn / .filterActive ──
+function AnalyticsPeriodDropdown({ value, onChange }) {
+  return (
+    <div className={styles.filters}>
+      {ANALYTICS_PERIODS.map(p => (
+        <button
+          key={p.id}
+          onClick={() => onChange(p.id)}
+          className={`${styles.filterBtn} ${value === p.id ? styles.filterActive : ''}`}
+        >
+          {p.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function PageAnalytics({ records, stats, loading }) {
+  const [period, setPeriod] = useState('monthly')
+
+  // filter to selected window, derive everything below from this subset
+  const periodRecords = filterRecordsByPeriod(records, period)
+
+  const total    = periodRecords.length
+  const hot      = periodRecords.filter(r => r.lead_category === 'HOT').length
+  const warm     = periodRecords.filter(r => r.lead_category === 'WARM').length
+  const cold     = periodRecords.filter(r => r.lead_category === 'COLD').length
+  const convRate = total ? Math.round(hot / total * 100) : 0
+  const avgScore = periodRecords.length
+    ? (periodRecords.reduce((s, r) => s + (r.lead_score || 0), 0) / periodRecords.length).toFixed(1)
+    : '0'
+
+  const durationData = ['HOT', 'WARM', 'COLD'].map(cat => {
+    const rows = periodRecords.filter(r => r.lead_category === cat && r.duration_sec)
+    const avg  = rows.length ? Math.round(rows.reduce((s, r) => s + r.duration_sec, 0) / rows.length) : 0
+    return { category: cat, avg_min: +(avg / 60).toFixed(1) }
+  })
+
+  const dowData = DOW_LABELS.map((d, i) => ({
+    day: d,
+    calls: periodRecords.filter(r => r.timestamp && new Date(r.timestamp).getDay() === i).length,
   }))
 
-  const sourceData = buildSourceData(records)
+  const svcMap = {}
+  periodRecords.forEach(r => (r.interested_services || []).forEach(s => { svcMap[s] = (svcMap[s] || 0) + 1 }))
+  const svcData = Object.entries(svcMap).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name, count]) => ({ name, count }))
+
+  const scoreOverTime = buildScoreSeries(periodRecords, period)
+
+  const periodLabel = period === 'weekly' ? 'Last 7 days' : period === 'yearly' ? 'Last 12 months' : 'Last 30 days'
 
   return (
     <>
+      {/* top-right period dropdown */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+        <AnalyticsPeriodDropdown value={period} onChange={setPeriod} />
+      </div>
+
       <div className={styles.metricsRow}>
-        <MetricCard icon={TrendingUp}   label="Conversion rate" value={loading ? '…' : `${convRate}%`}  sub="hot leads / total" color="var(--green)" />
-        <MetricCard icon={CheckCircle2} label="Avg lead score"  value={loading ? '…' : avgScore}        sub="out of 10" color="var(--warm)" />
-        <MetricCard icon={Flame}        label="Hot leads"       value={loading ? '…' : hot}             sub={`${total} total calls`} color="var(--hot)" />
-        <MetricCard icon={Phone}        label="Warm leads"      value={loading ? '…' : warm}            sub={`${total ? Math.round(warm/total*100) : 0}% of total`} color="var(--warm)" />
-        <MetricCard icon={Users}        label="Cold leads"      value={loading ? '…' : cold}            sub={`${total ? Math.round(cold/total*100) : 0}% of total`} color="var(--cold)" />
+        <MetricCard icon={TrendingUp}    label="Conversion Rate" value={loading ? '…' : `${convRate}%`} sub={periodLabel} color="var(--green)" />
+        <MetricCard icon={CheckCircle2}  label="Avg Lead Score"  value={loading ? '…' : avgScore}        sub={periodLabel} color="var(--warm)" />
+        <MetricCard icon={Flame}         label="Hot Leads"       value={loading ? '…' : hot}             sub={`${total} total calls`} color="var(--hot)" />
+        <MetricCard icon={Phone}         label="Warm Leads"      value={loading ? '…' : warm}            sub={`${total ? Math.round(warm/total*100) : 0}% of total`} color="var(--warm)" />
+        <MetricCard icon={Users}         label="Cold Leads"      value={loading ? '…' : cold}            sub={`${total ? Math.round(cold/total*100) : 0}% of total`} color="var(--cold)" />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: '1.5rem' }}>
         <div className={styles.chartCard}>
-          <h3 className={styles.chartTitle}>Avg call duration by category (min)</h3>
+          <h3 className={styles.chartTitle}>Avg call duration by category (min) · {periodLabel}</h3>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={durationData} margin={{ top: 5, right: 10, bottom: 0, left: -20 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
@@ -1545,7 +1617,7 @@ function PageAnalytics({ records, stats, loading }) {
         </div>
 
         <div className={styles.chartCard}>
-          <h3 className={styles.chartTitle}>Calls by day of week</h3>
+          <h3 className={styles.chartTitle}>Calls by day of week · {periodLabel}</h3>
           <ResponsiveContainer width="100%" height={200}>
             <BarChart data={dowData} margin={{ top: 5, right: 10, bottom: 0, left: -20 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
@@ -1558,7 +1630,9 @@ function PageAnalytics({ records, stats, loading }) {
         </div>
 
         <div className={styles.chartCard}>
-          <h3 className={styles.chartTitle}>Avg lead score over time</h3>
+          <h3 className={styles.chartTitle}>
+            Avg lead score over time — {period === 'weekly' ? 'by day of week' : period === 'yearly' ? 'by month' : 'by day'} · {periodLabel}
+          </h3>
           <ResponsiveContainer width="100%" height={200}>
             <AreaChart data={scoreOverTime} margin={{ top: 5, right: 10, bottom: 0, left: -20 }}>
               <defs>
@@ -1577,12 +1651,12 @@ function PageAnalytics({ records, stats, loading }) {
         </div>
 
         <div className={styles.chartCard}>
-          <h3 className={styles.chartTitle}>Top interested services</h3>
-          {serviceData.length === 0 ? (
+          <h3 className={styles.chartTitle}>Top interested services · {periodLabel}</h3>
+          {svcData.length === 0 ? (
             <VisualEmptyState message="No service data available" />
           ) : (
             <ResponsiveContainer width="100%" height={200}>
-              <BarChart layout="vertical" data={serviceData} margin={{ top: 5, right: 10, bottom: 0, left: 10 }}>
+              <BarChart layout="vertical" data={svcData} margin={{ top: 5, right: 10, bottom: 0, left: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                 <XAxis type="number" tick={{ fill: 'var(--text2)', fontSize: 11 }} axisLine={false} tickLine={false} />
                 <YAxis type="category" dataKey="name" tick={{ fill: 'var(--text2)', fontSize: 10 }} axisLine={false} tickLine={false} width={100} />
@@ -1599,467 +1673,383 @@ function PageAnalytics({ records, stats, loading }) {
 // ══════════════════════════════════════════════════════════════
 // PAGE: PROMPT
 // ══════════════════════════════════════════════════════════════
-function PagePrompt({ showToast }) {
+function PageAgentProfiles({ showToast }) {
+  const [agents, setAgents] = useState([])
+  const [agentsLoading, setAgentsLoading] = useState(true)
+  const [selectedId, setSelectedId] = useState('')
+
+  const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
   const [prompt, setPrompt] = useState('')
-  const [activePrompt, setActivePrompt] = useState('')
-  const [isEditing, setIsEditing] = useState(false)
-  const [lastSaved, setLastSaved] = useState(null)
+  const [promptLoading, setPromptLoading] = useState(false)
+  const [savingPrompt, setSavingPrompt] = useState(false)
+  const [dirty, setDirty] = useState(false)
 
-  // NEW
-  const [rollbackLog, setRollbackLog] = useState([])
+  const [showCreate, setShowCreate] = useState(false)
+  const [newId, setNewId] = useState('')
+  const [newName, setNewName] = useState('')
+  const [newPhone, setNewPhone] = useState('')
+  const [creating, setCreating] = useState(false)
 
-  const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
+  const [rollback, setRollback] = useState([])
+  const [hoveredLogId, setHoveredLogId] = useState(null)
 
-  // ────────────────────────────────────────────────────────────
-  // Load rollback history
-  // ────────────────────────────────────────────────────────────
-  async function loadRollbackHistory() {
+  // ── load all agents ──────────────────────────────────────────
+  async function loadAgents(selectAfter) {
+    setAgentsLoading(true)
     const { data, error } = await supabase
-      .from('prompt_versions')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(20)
-
-    if (!error) {
-      setRollbackLog(data || [])
-    } else {
-      console.error('[loadRollbackHistory]', error.message)
-    }
-  }
-
-  // ────────────────────────────────────────────────────────────
-  // Load active prompt
-  // ────────────────────────────────────────────────────────────
-  async function fetchPrompt() {
-    const { data, error } = await supabase
-      .from('agent_config')
-      .select('value, updated_at')
-      .eq('key', 'system_prompt')
-      .single()
+      .from('agents')
+      .select('agent_id, name, phone_number')
+      .order('created_at', { ascending: true })
 
     if (error) {
-      console.error('[fetchPrompt]', error.message)
-      setLoading(false)
+      showToast('Failed to load agents: ' + error.message, 'err')
+      setAgentsLoading(false)
       return
     }
 
-    setPrompt(data?.value || '')
-    setActivePrompt(data?.value || '')
+    const list = data || []
+    setAgents(list)
+    setAgentsLoading(false)
 
-    if (data?.updated_at) {
-      setLastSaved(new Date(data.updated_at))
+    if (selectAfter) {
+      setSelectedId(selectAfter)
+    } else if (!selectedId && list.length) {
+      setSelectedId(list[0].agent_id)
     }
-
-    setLoading(false)
   }
 
-  // ────────────────────────────────────────────────────────────
-  // Initial load
-  // ────────────────────────────────────────────────────────────
+  useEffect(() => { loadAgents() }, [])
+
+  // ── load profile fields + prompt whenever selection changes ──
   useEffect(() => {
-    fetchPrompt()
-    loadRollbackHistory()
-  }, [])
+    if (!selectedId) return
 
-  const tokenCount = useMemo(
-    () => Math.round((prompt || '').length / 4),
-    [prompt]
-  )
+    const a = agents.find(x => x.agent_id === selectedId)
+    setName(a?.name || '')
+    setPhone(a?.phone_number || '')
 
-  // ────────────────────────────────────────────────────────────
-  // SAVE PROMPT
-  // ────────────────────────────────────────────────────────────
-  async function save() {
-    try {
-      setSaving(true)
+    setPromptLoading(true)
+    setDirty(false)
 
-      const now = new Date().toISOString()
+    supabase
+      .from('agent_config')
+      .select('value')
+      .eq('agent_id', selectedId)
+      .eq('key', 'system_prompt')
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (error) {
+          showToast('Failed to load prompt: ' + error.message, 'err')
+        }
+        setPrompt(data?.value || '')
+        setPromptLoading(false)
+      })
 
-      // SAVE OLD PROMPT INTO HISTORY
-      await supabase
-        .from('prompt_versions')
-        .insert({
-          prompt_key: 'system_prompt',
-          prompt_value: activePrompt,
-          rollback_note: 'Manual production update',
-        })
+    supabase
+      .from('prompt_versions')
+      .select('id, prompt_value, rollback_note, created_at')
+      .eq('agent_id', selectedId)
+      .order('created_at', { ascending: false })
+      .limit(10)
+      .then(({ data, error }) => {
+        if (!error) setRollback(data || [])
+      })
+  }, [selectedId, agents])
 
-      // UPDATE LIVE PROMPT
-      const { error } = await supabase
-        .from('agent_config')
-        .update({
-          value: prompt,
-          updated_at: now,
-        })
-        .eq('key', 'system_prompt')
+  // ── save name / phone straight to agents table ───────────────
+  async function saveField(field, value) {
+    const { error } = await supabase
+      .from('agents')
+      .update({ [field]: value || null })
+      .eq('agent_id', selectedId)
 
-      setSaving(false)
-
-      if (error) {
-        console.error('[save prompt]', error.message)
-        showToast('Error saving prompt', 'err')
-        return
-      }
-
-      setActivePrompt(prompt)
-      setLastSaved(new Date(now))
-      setIsEditing(false)
-
-      await loadRollbackHistory()
-
-      showToast('Prompt deployed successfully ✓')
-    } catch (err) {
-      console.error(err)
-      setSaving(false)
-      showToast('Unexpected error occurred', 'err')
+    if (error) {
+      showToast('Save failed: ' + error.message, 'err')
+      return
     }
+    setAgents(prev => prev.map(a => a.agent_id === selectedId ? { ...a, [field]: value || null } : a))
   }
 
-  // ────────────────────────────────────────────────────────────
-  //ROLLBACK
-  // ────────────────────────────────────────────────────────────
-  async function rollbackPrompt(oldPrompt) {
-    try {
-      const { error } = await supabase
-        .from('agent_config')
-        .update({
-          value: oldPrompt,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('key', 'system_prompt')
+  // ── save prompt (per-agent, upsert keyed on agent_id+key) ────
+  async function savePrompt() {
+    setSavingPrompt(true)
 
-      if (error) {
-        console.error('[rollbackPrompt]', error.message)
-        showToast('Rollback failed', 'err')
-        return
-      }
+    const { error } = await supabase
+      .from('agent_config')
+      .upsert(
+        { agent_id: selectedId, key: 'system_prompt', value: prompt, updated_at: new Date().toISOString() },
+        { onConflict: 'agent_id,key' }
+      )
 
-      setPrompt(oldPrompt)
-      setActivePrompt(oldPrompt)
-
-      await fetchPrompt()
-      await loadRollbackHistory()
-
-      showToast('Rollback completed ✓')
-    } catch (err) {
-      console.error(err)
-      showToast('Rollback failed', 'err')
+    if (error) {
+      setSavingPrompt(false)
+      showToast('Prompt save failed: ' + error.message, 'err')
+      return
     }
+
+    await supabase.from('prompt_versions').insert({
+      agent_id: selectedId,
+      prompt_key: 'system_prompt',
+      prompt_value: prompt,
+      rollback_note: 'Manual update',
+    })
+
+    setSavingPrompt(false)
+    setDirty(false)
+    showToast('Prompt saved ✓')
+
+    const { data } = await supabase
+      .from('prompt_versions')
+      .select('id, prompt_value, rollback_note, created_at')
+      .eq('agent_id', selectedId)
+      .order('created_at', { ascending: false })
+      .limit(10)
+    setRollback(data || [])
   }
 
-  if (loading) {
-    return (
-      <p
-        style={{
-          color: 'var(--text2)',
-          padding: '2rem',
-          textAlign: 'center',
-        }}
-      >
-        Loading prompt…
-      </p>
-    )
+  async function rollbackTo(value) {
+    setPrompt(value)
+    setDirty(true)
+  }
+
+  // ── create a new agent ────────────────────────────────────────
+  async function createAgent() {
+    const id = newId.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_')
+    if (!id || !newName.trim()) {
+      showToast('Agent ID and name are required', 'err')
+      return
+    }
+
+    setCreating(true)
+
+    const { error: agentErr } = await supabase
+      .from('agents')
+      .insert({ agent_id: id, name: newName.trim(), phone_number: newPhone.trim() || null })
+
+    if (agentErr) {
+      setCreating(false)
+      showToast('Create failed: ' + agentErr.message, 'err')
+      return
+    }
+
+    const { error: cfgErr } = await supabase
+      .from('agent_config')
+      .insert({ agent_id: id, key: 'system_prompt', value: '', updated_at: new Date().toISOString() })
+
+    if (cfgErr) {
+      setCreating(false)
+      showToast('Agent created, but prompt row failed: ' + cfgErr.message, 'err')
+    } else {
+      showToast(`Agent "${newName.trim()}" created ✓`)
+    }
+
+    setCreating(false)
+    setShowCreate(false)
+    setNewId(''); setNewName(''); setNewPhone('')
+    await loadAgents(id)
+  }
+
+  // ── delete agent ──────────────────────────────────────────────
+  async function deleteAgent() {
+    if (selectedId === 'default') { showToast('Cannot delete the default agent', 'err'); return }
+    if (!window.confirm(`Delete agent "${name || selectedId}"? This removes its prompt and phone mapping.`)) return
+
+    await supabase.from('agent_config').delete().eq('agent_id', selectedId)
+    await supabase.from('prompt_versions').delete().eq('agent_id', selectedId)
+    const { error } = await supabase.from('agents').delete().eq('agent_id', selectedId)
+
+    if (error) {
+      showToast('Delete failed: ' + error.message, 'err')
+      return
+    }
+
+    showToast('Agent deleted')
+    setSelectedId('')
+    await loadAgents()
+  }
+
+  const inputStyle = {
+    width: '100%', background: 'var(--bg3)', border: '0.5px solid var(--border)',
+    borderRadius: 7, padding: '8px 10px', color: 'var(--text1)', fontSize: 13, outline: 'none',
   }
 
   return (
-    <div
-      style={{
-        display: 'grid',
-        gridTemplateColumns: '1fr 280px',
-        gap: 20,
-      }}
-    >
-      {/* LEFT PANEL */}
-      <div style={{ maxWidth: 720 }}>
-        <div
-          style={{
-            background: 'var(--accent-dim)',
-            border: '0.5px solid rgba(108,99,255,0.3)',
-            borderRadius: 10,
-            padding: '10px 14px',
-            marginBottom: 16,
-            fontSize: 13,
-            color: 'var(--text2)',
-          }}
-        >
-          <span
-            style={{
-              color: 'var(--accent)',
-              fontWeight: 600,
-            }}
-          >
-            System Deployment Mode
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* PROFILE SELECTOR */}
+      <div style={{ background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 12, padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            Profile
           </span>
 
-          {' '}— Modifying this mutates live agent logic instantly.
+          <select
+            value={selectedId}
+            onChange={e => setSelectedId(e.target.value)}
+            disabled={agentsLoading}
+            style={{ ...inputStyle, width: 'auto', minWidth: 220 }}
+          >
+            {agentsLoading && <option>Loading…</option>}
+            {!agentsLoading && agents.length === 0 && <option>No agents yet</option>}
+            {agents.map(a => (
+              <option key={a.agent_id} value={a.agent_id}>
+                {a.name || a.agent_id}{a.phone_number ? ` — ${a.phone_number}` : ''}
+              </option>
+            ))}
+          </select>
 
-          {lastSaved && (
-            <div
-              style={{
-                fontSize: 11,
-                marginTop: 4,
-                color: 'var(--text3)',
-              }}
+          <div style={{ flex: 1 }} />
+
+          <button
+            onClick={() => setShowCreate(p => !p)}
+            style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '6px 12px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text2)', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}
+          >
+            <Plus size={13} /> New Agent
+          </button>
+
+          {selectedId && selectedId !== 'default' && (
+            <button
+              onClick={deleteAgent}
+              style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '6px 10px', background: 'none', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--hot)', fontSize: 12, cursor: 'pointer' }}
             >
-              Last saved: {lastSaved.toLocaleString()}
-            </div>
+              <Trash2 size={13} />
+            </button>
           )}
         </div>
 
-        {!isEditing ? (
-          <div
-            style={{
-              background: 'var(--bg2)',
-              border: '1px dashed var(--border)',
-              borderRadius: 10,
-              padding: '16px',
-            }}
-          >
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginBottom: 12,
-              }}
-            >
-              <span
-                style={{
-                  fontSize: 11,
-                  fontWeight: 600,
-                  color: 'var(--green)',
-                  textTransform: 'uppercase',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 4,
-                }}
-              >
-                <span
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: '50%',
-                    background: 'var(--green)',
-                    display: 'inline-block',
-                  }}
-                />
-
-                Active Live Prompt
-              </span>
-
-              <button
-                onClick={() => setIsEditing(true)}
-                style={{
-                  padding: '4px 12px',
-                  background: 'var(--bg3)',
-                  border: '0.5px solid var(--border2)',
-                  color: 'var(--text1)',
-                  fontSize: 12,
-                  borderRadius: 6,
-                  cursor: 'pointer',
-                }}
-              >
-                Modify Production Prompt
-              </button>
+        {selectedId && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                Name
+              </label>
+              <input
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onBlur={e => saveField('name', e.target.value.trim())}
+                placeholder="e.g. Alex"
+                style={inputStyle}
+              />
             </div>
-
-            <pre
-              style={{
-                whiteSpace: 'pre-wrap',
-                fontSize: 12,
-                color: 'var(--text2)',
-                fontFamily: 'monospace',
-                margin: 0,
-                lineHeight: 1.6,
-              }}
-            >
-              {activePrompt || 'No prompt configured yet.'}
-            </pre>
+            <div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                <Phone size={11} /> Phone Number
+              </label>
+              <input
+                value={phone}
+                onChange={e => setPhone(e.target.value)}
+                onBlur={e => saveField('phone_number', e.target.value.trim())}
+                placeholder="+14155551234"
+                style={inputStyle}
+              />
+            </div>
           </div>
-        ) : (
-          <>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              rows={18}
-              style={{
-                width: '100%',
-                background: 'var(--bg2)',
-                border: '1px solid var(--accent)',
-                borderRadius: 10,
-                padding: '14px 16px',
-                color: 'var(--text1)',
-                fontSize: 13,
-                lineHeight: 1.7,
-                outline: 'none',
-                resize: 'vertical',
-                fontFamily: 'inherit',
-                boxSizing: 'border-box',
-              }}
-            />
-
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginTop: 12,
-              }}
-            >
-              <span
-                style={{
-                  fontSize: 12,
-                  color: 'var(--text3)',
-                }}
-              >
-                <b>{prompt.length}</b> chars ·{' '}
-                <b>{tokenCount}</b> est. tokens
-              </span>
-
-              <div
-                style={{
-                  display: 'flex',
-                  gap: 8,
-                }}
-              >
-                <button
-                  onClick={() => {
-                    setPrompt(activePrompt)
-                    setIsEditing(false)
-                  }}
-                  style={{
-                    padding: '8px 14px',
-                    background: 'transparent',
-                    border: 'none',
-                    color: 'var(--text2)',
-                    fontSize: 13,
-                    cursor: 'pointer',
-                  }}
-                >
-                  Cancel
-                </button>
-
-                <button
-                  onClick={save}
-                  disabled={saving}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6,
-                    padding: '9px 20px',
-                    background: 'var(--accent)',
-                    border: 'none',
-                    borderRadius: 8,
-                    color: '#fff',
-                    fontSize: 13,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    opacity: saving ? 0.6 : 1,
-                  }}
-                >
-                  <Save size={14} />
-                  {saving ? 'Deploying…' : 'Publish Version'}
-                </button>
-              </div>
-            </div>
-          </>
         )}
       </div>
 
-      {/* RIGHT PANEL */}
-      <div
-        style={{
-          background: 'var(--bg2)',
-          borderRadius: 12,
-          padding: '14px',
-          border: '0.5px solid var(--border)',
-          height: 'fit-content',
-        }}
-      >
-        <h4
-          style={{
-            margin: '0 0 12px 0',
-            fontSize: 12,
-            textTransform: 'uppercase',
-            color: 'var(--text2)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-          }}
-        >
-          <History size={13} />
-          Rollback Log
-        </h4>
+      {/* CREATE FORM */}
+      {showCreate && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, background: 'var(--bg2)', border: '0.5px solid var(--accent)', borderRadius: 12, padding: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+            <input value={newId} onChange={e => setNewId(e.target.value)} placeholder="agent_id (e.g. alex)" style={inputStyle} />
+            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Display name" style={inputStyle} />
+            <input value={newPhone} onChange={e => setNewPhone(e.target.value)} placeholder="Phone +1..." style={inputStyle} />
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button onClick={() => setShowCreate(false)} style={{ padding: '7px 12px', background: 'transparent', border: 'none', color: 'var(--text2)', fontSize: 12, cursor: 'pointer' }}>
+              Cancel
+            </button>
+            <button
+              onClick={createAgent}
+              disabled={creating}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 7, color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', opacity: creating ? 0.6 : 1 }}
+            >
+              <Plus size={13} /> {creating ? 'Creating…' : 'Create Agent'}
+            </button>
+          </div>
+        </div>
+      )}
 
-        {rollbackLog.length === 0 ? (
-          <p
-            style={{
-              fontSize: 11,
-              color: 'var(--text3)',
-              margin: 0,
-            }}
-          >
-            No rollback history found.
-          </p>
-        ) : (
-          <div
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 8,
-            }}
-          >
-            {rollbackLog.map((log) => (
-              <div
-                key={log.id}
+      {/* PROMPT EDITOR */}
+      {selectedId && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 280px', gap: 20 }}>
+          <div>
+            <textarea
+              value={prompt}
+              onChange={e => { setPrompt(e.target.value); setDirty(true) }}
+              disabled={promptLoading}
+              placeholder={promptLoading ? 'Loading prompt…' : 'System prompt for this agent…'}
+              style={{
+                width: '100%', minHeight: 420, background: 'var(--bg2)', border: '0.5px solid var(--border)',
+                borderRadius: 10, padding: 14, color: 'var(--text1)', fontSize: 13, fontFamily: 'monospace',
+                lineHeight: 1.5, resize: 'vertical', outline: 'none',
+              }}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10 }}>
+              <button
+                onClick={savePrompt}
+                disabled={!dirty || savingPrompt || promptLoading}
                 style={{
-                  background: 'var(--bg3)',
-                  borderRadius: 6,
-                  padding: '8px',
-                  fontSize: 11,
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px',
+                  background: dirty ? 'var(--accent)' : 'var(--bg3)', border: 'none', borderRadius: 8,
+                  color: dirty ? '#fff' : 'var(--text3)', fontSize: 13, fontWeight: 600,
+                  cursor: dirty ? 'pointer' : 'default', opacity: savingPrompt ? 0.6 : 1,
                 }}
               >
-                <p
-                  style={{
-                    color: 'var(--text3)',
-                    margin: '0 0 4px 0',
-                  }}
-                >
+                <Save size={14} /> {savingPrompt ? 'Saving…' : 'Save Prompt'}
+              </button>
+              <span style={{ fontSize: 11, color: 'var(--text3)' }}>
+                {Math.round((prompt || '').length / 4)} tokens (approx)
+              </span>
+            </div>
+          </div>
+
+          {/* ROLLBACK HISTORY */}
+          <div>
+            <h3 style={{ fontSize: 12, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, margin: '0 0 10px 0' }}>
+              History
+            </h3>
+            {rollback.length === 0 && (
+              <p style={{ fontSize: 12, color: 'var(--text3)' }}>No saved versions yet.</p>
+            )}
+            {rollback.map(log => (
+              <div
+                key={log.id}
+                onMouseEnter={() => setHoveredLogId(log.id)}
+                onMouseLeave={() => setHoveredLogId(null)}
+                style={{ position: 'relative', background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8, cursor: 'default' }}
+              >
+                <p style={{ color: 'var(--text3)', margin: '0 0 4px 0', fontSize: 11 }}>
                   {new Date(log.created_at).toLocaleString()}
                 </p>
-
-                <p
-                  style={{
-                    color: 'var(--text2)',
-                    margin: '0 0 6px 0',
-                    fontSize: 10,
-                  }}
-                >
-                  {log.rollback_note}
-                </p>
-
                 <button
-                  onClick={() =>
-                    rollbackPrompt(log.prompt_value)
-                  }
-                  style={{
-                    background: 'transparent',
-                    border: 'none',
-                    padding: 0,
-                    color: 'var(--accent)',
-                    cursor: 'pointer',
-                    fontSize: 11,
-                    fontWeight: 500,
-                  }}
+                  onClick={() => rollbackTo(log.prompt_value)}
+                  style={{ background: 'transparent', border: 'none', padding: 0, color: 'var(--accent)', cursor: 'pointer', fontSize: 11, fontWeight: 500 }}
                 >
-                  Rollback →
+                  Load this version →
                 </button>
+
+                {hoveredLogId === log.id && (
+                  <div
+                    style={{
+                      position: 'absolute', right: '100%', top: 0, marginRight: 10,
+                      width: 380, maxHeight: 320, overflowY: 'auto',
+                      background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8,
+                      padding: 12, boxShadow: '0 8px 24px rgba(0,0,0,0.45)', zIndex: 100,
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                      fontSize: 11, fontFamily: 'monospace', lineHeight: 1.5,
+                      color: 'var(--text1)', pointerEvents: 'none',
+                    }}
+                  >
+                    {log.prompt_value || '(empty prompt)'}
+                  </div>
+                )}
               </div>
             ))}
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -2072,7 +2062,7 @@ const NAV = [
   { id: 'conversations', icon: FileText,       label: 'Conversations' },
   { id: 'analytics',     icon: BarChart2,      label: 'Analytics'     },
   { id: 'forms',         icon: ClipboardList,  label: 'Forms', badgeKey: 'forms' },
-  { id: 'prompt',        icon: MessageSquare,  label: 'Agent Prompt'  },
+  { id: 'prompt',        icon: MessageSquare,  label: 'Agent Profiles'  },
   { id: 'settings',      icon: Settings,       label: 'Settings'      },
 ]
 
@@ -2222,7 +2212,7 @@ export default function Dashboard() {
         {page === 'conversations' && <PageConversations records={records} loading={loading} openTranscript={openTranscript} globalSearch={globalSearch} />}
         {page === 'forms'         && <PageForms         showToast={showToast} globalSearch={globalSearch} setFormCount={setFormCount} />}
         {page === 'analytics'     && <PageAnalytics     records={records} stats={stats} loading={loading} />}
-        {page === 'prompt'        && <PagePrompt        showToast={showToast} />}
+        {page === 'prompt'        && <PageAgentProfiles showToast={showToast} />}
         {page === 'settings' && <PageSettings supabase={supabase} showToast={showToast} onConfigChange={cfg => setAgentConfig(c => ({ ...c, ...cfg }))} />}
       </main>
 

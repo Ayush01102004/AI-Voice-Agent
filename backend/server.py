@@ -45,6 +45,7 @@ DEEPGRAM_API_KEY  = os.getenv("DEEPGRAM_API_KEY") or ""
 CALL_HANDLER_URL  = os.getenv("CALL_HANDLER_URL", "http://localhost:8000").rstrip("/")
 PORT              = int(os.getenv("PORT", "5002"))
 TELNYX_PUBLIC_KEY = os.getenv("TELNYX_PUBLIC_KEY", "")
+INTERNAL_API_KEY  = os.getenv("INTERNAL_API_KEY", "")  # NEW: shared secret for calling call_handler.py
 
 if not DEEPGRAM_API_KEY:
     raise ValueError("DEEPGRAM_API_KEY missing")
@@ -54,7 +55,7 @@ if not DEEPGRAM_API_KEY:
 KEEPALIVE_INTERVAL_S      = 8.0
 FRAME_DURATION_S          = 0.020
 SILENCE_THRESHOLD         = 80.0
-GHOST_CALL_TIMEOUT_S      = 10.0
+GHOST_CALL_TIMEOUT_S      = 18.0   # CHANGED: was 10.0 — longer grace period before auto-hangup on silence
 AMD_SPEECH_TIMEOUT_S      = 4.0
 AMD_MAX_WAIT_S            = 8.0
 WARNING_DURATION_S        = 4 * 60
@@ -65,6 +66,7 @@ HISTORY_REPLAY_TURNS      = 8
 SEND_QUEUE_MAXSIZE        = 200
 CONFIG_FETCH_RETRIES      = 3
 CONFIG_FETCH_BACKOFF_S    = 1.0
+WEBHOOK_TIMESTAMP_SKEW_S  = 300.0  # NEW: max allowed age of a Telnyx webhook signature timestamp
 
 VOICEMAIL_PHRASES = frozenset([
     "leave a message", "leave your message", "after the tone", "after the beep",
@@ -288,7 +290,7 @@ class Session:
 
     __slots__ = (
         # identity
-        "call_sid", "stream_sid",
+        "call_sid", "stream_sid", "agent_id",
         # deepgram
         "_cm", "agent_conn", "dg_lock",
         # queues
@@ -323,6 +325,7 @@ class Session:
     def __init__(self) -> None:
         self.call_sid        = ""
         self.stream_sid      = ""
+        self.agent_id        = "default"
         self._cm             = None
         self.agent_conn      = None
         self.dg_lock         = threading.Lock()
@@ -443,35 +446,119 @@ def _dg_close(cm, lock: threading.Lock) -> None:
 
 # ── Config fetch ──────────────────────────────────────────────────────────────
 
-_config_cache: Dict[str, Any] = {}
-_config_cache_ts: float = 0.0
+DEFAULT_AGENT_ID = "default"
+
+# NEW: config cache is now keyed per agent_id so 10 personas served by one
+# deployment each get independent cache entries/TTLs instead of fighting
+# over one global config.
+_config_cache: Dict[str, Dict[str, Any]] = {}       # {agent_id: {...}}
+_config_cache_ts: Dict[str, float] = {}              # {agent_id: monotonic_ts}
+_config_cache_lock = asyncio.Lock()  # NEW: prevents thundering-herd concurrent fetches
 _CONFIG_CACHE_TTL_S = 60.0
 
-async def fetch_agent_config(force: bool = False) -> Dict[str, Any]:
+async def fetch_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = False) -> Dict[str, Any]:
     global _config_cache, _config_cache_ts
+
+    # NEW: lock wraps the whole check+fetch so concurrent callers don't all
+    # hit CALL_HANDLER_URL at once when cache expires under load.
+    async with _config_cache_lock:
+        now       = time.monotonic()
+        cached    = _config_cache.get(agent_id)
+        cached_ts = _config_cache_ts.get(agent_id, 0.0)
+        if not force and (now - cached_ts) < _CONFIG_CACHE_TTL_S and cached:
+            return cached
+
+        for attempt in range(CONFIG_FETCH_RETRIES):
+            if attempt:
+                await asyncio.sleep(CONFIG_FETCH_BACKOFF_S * attempt)
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(
+                        f"{CALL_HANDLER_URL}/api/config",
+                        params={"agent_id": agent_id},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        if resp.status == 200:
+                            cfg = await resp.json()
+                            _config_cache[agent_id]    = cfg
+                            _config_cache_ts[agent_id] = now
+                            return cfg
+                        log.warning("config HTTP %s attempt %d (agent_id=%s)", resp.status, attempt + 1, agent_id)
+            except Exception as e:
+                log.warning("config attempt %d (agent_id=%s): %s", attempt + 1, agent_id, e)
+
+        log.warning("config fetch failed for agent_id=%s — using cache or defaults", agent_id)
+        return _config_cache.get(agent_id, {})
+
+
+# NEW: resolve which agent_id a call belongs to, based on the Telnyx "to"
+# number. Cached briefly — call volume shouldn't hammer call_handler for
+# a mapping that changes maybe once a week.
+_phone_map_cache: Dict[str, str] = {}
+_phone_map_cache_ts: float = 0.0
+_PHONE_MAP_TTL_S = 300.0
+
+async def resolve_agent_id(to_number: Optional[str]) -> str:
+    global _phone_map_cache, _phone_map_cache_ts
+    if not to_number:
+        return DEFAULT_AGENT_ID
+
     now = time.monotonic()
-    if not force and (now - _config_cache_ts) < _CONFIG_CACHE_TTL_S and _config_cache:
-        return _config_cache
+    if to_number in _phone_map_cache and (now - _phone_map_cache_ts) < _PHONE_MAP_TTL_S:
+        return _phone_map_cache[to_number]
 
-    for attempt in range(CONFIG_FETCH_RETRIES):
-        if attempt:
-            await asyncio.sleep(CONFIG_FETCH_BACKOFF_S * attempt)
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(
-                    f"{CALL_HANDLER_URL}/api/config",
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        _config_cache    = await resp.json()
-                        _config_cache_ts = now
-                        return _config_cache
-                    log.warning("config HTTP %s attempt %d", resp.status, attempt + 1)
-        except Exception as e:
-            log.warning("config attempt %d: %s", attempt + 1, e)
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                f"{CALL_HANDLER_URL}/api/agent-for-number",
+                params={"to": to_number},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    agent_id = data.get("agent_id", DEFAULT_AGENT_ID)
+                    _phone_map_cache[to_number] = agent_id
+                    _phone_map_cache_ts = now
+                    return agent_id
+    except Exception as e:
+        log.warning("agent-for-number lookup failed for %s: %s", to_number, e)
 
-    log.warning("config fetch failed — using cache or defaults")
-    return _config_cache or {}
+    return DEFAULT_AGENT_ID
+
+# ── Call result persistence ───────────────────────────────────────────────────
+# NEW: hook so lead facts + transcript survive even if the call drops before
+# an explicit end_conversation() call. Wire this to your actual Supabase
+# client/table — left as a safe no-op + log if not yet implemented, so
+# _cleanup() never breaks even before you wire persistence in.
+
+async def save_call_result(
+    call_sid: str,
+    facts: Dict[str, Any],
+    outcome: Optional[str],
+    history: List[Dict[str, str]],
+) -> None:
+    # CHANGED: no longer a stub. POSTs to call_handler.py's
+    # /api/call-live-facts, which performs the actual Supabase write.
+    # server.py never touches the DB directly — call_handler.py stays
+    # the single writer to the "calls" table.
+    headers = {"X-Internal-Key": INTERNAL_API_KEY} if INTERNAL_API_KEY else {}
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                f"{CALL_HANDLER_URL}/api/call-live-facts",
+                json={
+                    "call_sid": call_sid,
+                    "facts":    facts,
+                    "outcome":  outcome,
+                    "history":  history,
+                },
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    clog(call_sid, f"save_call_result HTTP {resp.status}")
+    except Exception as e:
+        clog(call_sid, f"save_call_result failed: {e}")
 
 # ── Background tasks ──────────────────────────────────────────────────────────
 
@@ -551,11 +638,33 @@ async def duration_guard(ws: web.WebSocketResponse, s: Session) -> None:
 
         clog(s.call_sid, "hard duration limit reached")
         log_outcome(s.call_sid, CallOutcome.CALL_DROPPED, "hard duration limit")
+
+        # CHANGED: hard limit now speaks a closing line instead of dropping
+        # silently. Reuses the same InjectAgentMessage + pending_hangup path
+        # as the 4-min warning, so AgentAudioDone still drives the graceful
+        # hangup timing. Falls back to old immediate-drop if inject fails.
+        socket = s.agent_conn
+        injected = False
+        if socket:
+            try:
+                await asyncio.to_thread(
+                    socket.send,
+                    json.dumps({
+                        "type":    "InjectAgentMessage",
+                        "message": "I've got to wrap up now — thank you so much for your time today. Have a great day!",
+                    })
+                )
+                injected = True
+            except Exception as e:
+                clog(s.call_sid, f"hard-limit inject error: {e}")
+
         with s.lock:
             s.pending_hangup = True
             s.outcome        = CallOutcome.CALL_DROPPED
-        if not s.agent_speaking:
+
+        if not injected and not s.agent_speaking:
             await _perform_hangup(ws, s.call_sid)
+
         await asyncio.sleep(5.0)
         if ws_open(ws):
             await ws.close()
@@ -824,6 +933,11 @@ async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> b
     stream_sid = data.get("streamSid", "")
     call_sid   = start.get("call_control_id") or start.get("callSid") or stream_sid
 
+    # NEW: Telnyx Media Streams "start" payload carries the dialed number.
+    # This is what routes the call to the right agent_id — no per-agent
+    # deployment needed, just a lookup keyed on which DID was called.
+    to_number = start.get("to") or data.get("to")
+
     s.stream_sid      = stream_sid
     s.call_sid        = call_sid
     s.call_start_time = time.monotonic()
@@ -832,7 +946,11 @@ async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> b
     clog(call_sid, "call started")
 
     try:
-        cfg           = await fetch_agent_config()
+        agent_id      = await resolve_agent_id(to_number)
+        s.agent_id    = agent_id
+        clog(call_sid, f"routed to agent_id={agent_id} (to={to_number})")
+
+        cfg           = await fetch_agent_config(agent_id)
         agent_name    = cfg.get("agent_name", "").strip() or "Ella"
         lead_name     = cfg.get("lead_name",  "").strip() or None
         system_prompt = cfg.get("system_prompt", "").strip() or build_system_prompt(agent_name, lead_name)
@@ -869,45 +987,55 @@ async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> b
         return False
 
 # ── Media frame processing ────────────────────────────────────────────────────
+# CHANGED: split into _should_analyze / _check_ghost_call / _check_amd so the
+# "not s.agent_speaking" gate is checked once, rms computed once, and each
+# detector (ghost / AMD) is an independent, testable function.
+
+def _should_analyze(s: Session) -> bool:
+    """Skip rms calc entirely once both detectors are done and agent isn't speaking."""
+    return not s.agent_speaking and (not s.ghost_fired or not s.amd_done)
+
+def _check_ghost_call(ws: web.WebSocketResponse, s: Session, rms: float, loop: asyncio.AbstractEventLoop) -> None:
+    if s.ghost_fired:
+        return
+    if rms < SILENCE_THRESHOLD:
+        with s.lock:
+            s.silence_seconds += FRAME_DURATION_S
+            silence = s.silence_seconds
+        if silence >= GHOST_CALL_TIMEOUT_S:
+            run_async(ghost_call_hangup(ws, s), loop)
+    else:
+        with s.lock:
+            s.silence_seconds = 0.0
+
+def _check_amd(ws: web.WebSocketResponse, s: Session, rms: float, loop: asyncio.AbstractEventLoop) -> None:
+    if s.amd_done:
+        return
+    if rms >= SILENCE_THRESHOLD:
+        if s.amd_speech_start is None:
+            with s.lock:
+                s.amd_speech_start = time.monotonic()
+        else:
+            elapsed = time.monotonic() - s.amd_speech_start
+            if elapsed >= AMD_SPEECH_TIMEOUT_S:
+                with s.lock:
+                    s.call_type = CallType.VOICEMAIL
+                    s.amd_done  = True
+                log_outcome(s.call_sid, CallOutcome.VOICEMAIL, f"uninterrupted speech {elapsed:.1f}s")
+                run_async(ws.close(), loop)
+    else:
+        with s.lock:
+            s.amd_speech_start = None
 
 def _process_media(ws: web.WebSocketResponse, s: Session, raw: bytes, loop: asyncio.AbstractEventLoop) -> None:
     enqueue_audio(s.send_q, raw)
 
-    need_rms = (
-        (not s.agent_speaking and not s.ghost_fired)
-        or (not s.amd_done and not s.agent_speaking)
-    )
-    rms = ulaw_rms(raw) if need_rms else 0.0
+    if not _should_analyze(s):
+        return
 
-    # Ghost-call detection
-    if not s.agent_speaking and not s.ghost_fired:
-        if rms < SILENCE_THRESHOLD:
-            with s.lock:
-                s.silence_seconds += FRAME_DURATION_S
-                silence = s.silence_seconds
-            if silence >= GHOST_CALL_TIMEOUT_S:
-                run_async(ghost_call_hangup(ws, s), loop)
-        else:
-            with s.lock:
-                s.silence_seconds = 0.0
-
-    # AMD energy detection
-    if not s.amd_done and not s.agent_speaking:
-        if rms >= SILENCE_THRESHOLD:
-            if s.amd_speech_start is None:
-                with s.lock:
-                    s.amd_speech_start = time.monotonic()
-            else:
-                elapsed = time.monotonic() - s.amd_speech_start
-                if elapsed >= AMD_SPEECH_TIMEOUT_S:
-                    with s.lock:
-                        s.call_type = CallType.VOICEMAIL
-                        s.amd_done  = True
-                    log_outcome(s.call_sid, CallOutcome.VOICEMAIL, f"uninterrupted speech {elapsed:.1f}s")
-                    run_async(ws.close(), loop)
-        else:
-            with s.lock:
-                s.amd_speech_start = None
+    rms = ulaw_rms(raw)  # computed once, shared by both checks
+    _check_ghost_call(ws, s, rms, loop)
+    _check_amd(ws, s, rms, loop)
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
@@ -941,6 +1069,14 @@ async def _cleanup(s: Session) -> None:
     if cm := s._cm:
         await asyncio.to_thread(_dg_close, cm, s.dg_lock)
 
+    # NEW: persist lead facts + transcript even if end_conversation() was
+    # never called (crash / drop / hard duration limit). Safe no-op stub
+    # until save_call_result() is wired to real storage.
+    try:
+        await save_call_result(call_sid, dict(s.facts), s.outcome, list(s.history))
+    except Exception as e:
+        clog(call_sid, f"save_call_result error: {e}")
+
     clog(call_sid, f"cleanup done — outcome={s.outcome}")
 
 # ── Telnyx webhook ────────────────────────────────────────────────────────────
@@ -951,9 +1087,20 @@ async def telnyx_voice(request: web.Request) -> web.Response:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
             sig       = request.headers.get("X-Telnyx-Signature-Ed25519", "")
             timestamp = request.headers.get("X-Telnyx-Timestamp", "")
+
+            # NEW: reject stale timestamps to close the signature-replay window.
+            try:
+                ts_val = float(timestamp)
+            except (TypeError, ValueError):
+                raise web.HTTPForbidden(reason="Missing or invalid Telnyx timestamp")
+            if abs(time.time() - ts_val) > WEBHOOK_TIMESTAMP_SKEW_S:
+                raise web.HTTPForbidden(reason="Stale Telnyx webhook timestamp")
+
             body      = await request.read()
             pub_key   = Ed25519PublicKey.from_public_bytes(base64.b64decode(TELNYX_PUBLIC_KEY))
             pub_key.verify(base64.b64decode(sig), (timestamp + "|").encode() + body)
+        except web.HTTPForbidden:
+            raise
         except Exception as exc:
             log.warning("sig verify failed: %s", exc)
             raise web.HTTPForbidden(reason="Invalid Telnyx signature")

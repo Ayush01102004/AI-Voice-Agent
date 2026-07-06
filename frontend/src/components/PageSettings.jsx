@@ -102,6 +102,7 @@ export default function PageSettings({ showToast, onConfigChange, supabase }) {
     const { data, error } = await supabase
       .from('agent_config')
       .select('key, value')
+      .eq('agent_id', 'default')   // global app settings live under the default agent bucket
       .in('key', keys)
 
     if (error) { console.error('[PageSettings load]', error.message); setLoading(false); return }
@@ -134,24 +135,24 @@ export default function PageSettings({ showToast, onConfigChange, supabase }) {
     setSaving(true)
     const now = new Date().toISOString()
     const rows = [
-      { key: 'website_link',         value: websiteLink,                 updated_at: now },
-      { key: 'transcript_retention', value: retention,                   updated_at: now },
-      { key: 'custom_connections',   value: JSON.stringify(customConns), updated_at: now },
+      { agent_id: 'default', key: 'website_link',         value: websiteLink,                 updated_at: now },
+      { agent_id: 'default', key: 'transcript_retention', value: retention,                   updated_at: now },
+      { agent_id: 'default', key: 'custom_connections',   value: JSON.stringify(customConns), updated_at: now },
       ...BUILTIN_CONNECTIONS.map(c => ({
-        key: c.key, value: conns[c.key] || '', updated_at: now,
+        agent_id: 'default', key: c.key, value: conns[c.key] || '', updated_at: now,
       })),
     ]
 
     if (newAdminPw.trim() && adminLoggedIn) {
       const hash = await hashPassword(newAdminPw.trim())
-      rows.push({ key: ADMIN_KEY, value: hash, updated_at: now })
+      rows.push({ agent_id: 'default', key: ADMIN_KEY, value: hash, updated_at: now })
       setStoredHash(hash)
       setNewAdminPw('')
     }
 
     const { error } = await supabase
       .from('agent_config')
-      .upsert(rows, { onConflict: 'key' })
+      .upsert(rows, { onConflict: 'agent_id,key' })
 
     setSaving(false)
     if (error) { console.error('[PageSettings save]', error.message); showToast('Error saving settings', 'err'); return }
@@ -171,7 +172,7 @@ export default function PageSettings({ showToast, onConfigChange, supabase }) {
     if (!storedHash) {
       const { error } = await supabase
         .from('agent_config')
-        .upsert([{ key: ADMIN_KEY, value: hash, updated_at: new Date().toISOString() }], { onConflict: 'key' })
+        .upsert([{ agent_id: 'default', key: ADMIN_KEY, value: hash, updated_at: new Date().toISOString() }], { onConflict: 'agent_id,key' })
       if (error) { setLoginError('Error saving password.'); return }
       setStoredHash(hash)
       setAdminLoggedIn(true)

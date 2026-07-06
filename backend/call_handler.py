@@ -14,9 +14,17 @@ Upgrades vs v3.2.0:
   12. agent_config cache with TTL=5min            [prompt edits apply fast]
   13. Telnyx webhook replaces Twilio              [POST /telnyx-webhook]
   14. lead_name exposed in /api/config            [server.py recovery memory]
+
+Upgrades vs v3.4.0:
+  15. Telnyx webhook signature verification        [was unauthenticated]
+  16. retry/backoff on delayed recording fetch      [was single-shot after fixed 5s sleep]
+  17. CORS origins now env-configurable             [was allow_origins=["*"] hardcoded]
+  18. /api/call-live-facts endpoint                  [receives server.py's live-call facts/history,
+                                                       so call_handler.py stays the single DB writer]
 """
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -42,6 +50,11 @@ N8N_WEBHOOK_URL           = os.getenv("N8N_WEBHOOK_URL", "")
 SUPABASE_URL              = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 TELNYX_API_KEY            = os.getenv("TELNYX_API_KEY", "")   # UPGRADE #13
+TELNYX_PUBLIC_KEY         = os.getenv("TELNYX_PUBLIC_KEY", "")  # NEW: UPGRADE #15
+INTERNAL_API_KEY          = os.getenv("INTERNAL_API_KEY", "")   # NEW: UPGRADE #18 — shared secret for server.py → call_handler.py calls
+ALLOWED_ORIGINS           = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+]  # NEW: UPGRADE #17
 
 for name, val in [
     ("DEEPGRAM_API_KEY",          DEEPGRAM_API_KEY),
@@ -55,10 +68,16 @@ for name, val in [
 groq_client: AsyncGroq       = AsyncGroq(api_key=GROQ_API_KEY)
 supabase:    Optional[Client] = None
 
+# ── NEW: UPGRADE #15/#16 constants ───────────────────────────
+
+WEBHOOK_TIMESTAMP_SKEW_S     = 300.0  # reject Telnyx webhook timestamps older than this
+RECORDING_FETCH_RETRIES      = 3
+RECORDING_FETCH_BACKOFF_S    = 4.0    # multiplied by attempt number, on top of the initial 5s wait
+
 # ── UPGRADE #12: agent_config cache ──────────────────────────
 
-_CONFIG_CACHE:    Dict[str, str] = {}
-_CONFIG_CACHE_TS: float = 0.0
+_CONFIG_CACHE:    Dict[str, Dict[str, str]] = {}   # {agent_id: {key: value}}
+_CONFIG_CACHE_TS: Dict[str, float] = {}             # {agent_id: monotonic_ts}
 _CONFIG_TTL:      float = 300.0  # 5 minutes
 
 _DEFAULT_SYSTEM_PROMPT = """
@@ -84,37 +103,79 @@ Understand customer needs and guide the conversation naturally.
 """.strip()
 
 
-def _fetch_agent_config_sync() -> Dict[str, str]:
+DEFAULT_AGENT_ID = "default"
+
+def _fetch_agent_config_sync(agent_id: str) -> Dict[str, str]:
     rows = (
         _get_supabase()
         .table("agent_config")
         .select("key, value")
+        .eq("agent_id", agent_id)
         .execute()
         .data or []
     )
     return {r["key"]: r["value"] for r in rows}
 
 
-async def get_agent_config(force: bool = False) -> Dict[str, str]:
+# UPGRADE #19: config cache is now keyed per agent_id (multi-agent support).
+# _CONFIG_CACHE / _CONFIG_CACHE_TS are dicts: {agent_id: {...}} / {agent_id: ts}
+# so each agent's prompt/name/etc refreshes independently and one agent's
+# cache miss never forces a refetch of the other nine.
+async def get_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = False) -> Dict[str, str]:
     global _CONFIG_CACHE, _CONFIG_CACHE_TS
     now = time.monotonic()
-    if force or not _CONFIG_CACHE or (now - _CONFIG_CACHE_TS) > _CONFIG_TTL:
+    cached    = _CONFIG_CACHE.get(agent_id)
+    cached_ts = _CONFIG_CACHE_TS.get(agent_id, 0.0)
+    if force or not cached or (now - cached_ts) > _CONFIG_TTL:
         try:
-            _CONFIG_CACHE    = await asyncio.to_thread(_fetch_agent_config_sync)
-            _CONFIG_CACHE_TS = now
-            print(f"[config] refreshed — {len(_CONFIG_CACHE)} keys")
+            cfg = await asyncio.to_thread(_fetch_agent_config_sync, agent_id)
+            _CONFIG_CACHE[agent_id]    = cfg
+            _CONFIG_CACHE_TS[agent_id] = now
+            print(f"[config] refreshed agent_id={agent_id} — {len(cfg)} keys")
         except Exception as e:
-            print(f"[config] fetch failed, using cache/defaults: {e}")
-    return _CONFIG_CACHE
+            print(f"[config] fetch failed for agent_id={agent_id}, using cache/defaults: {e}")
+    return _CONFIG_CACHE.get(agent_id, {})
 
 
-async def get_system_prompt() -> str:
-    cfg    = await get_agent_config()
+async def get_system_prompt(agent_id: str = DEFAULT_AGENT_ID) -> str:
+    cfg    = await get_agent_config(agent_id)
     prompt = cfg.get("system_prompt", "").strip()
     if not prompt:
-        print("[config] system_prompt not in DB — using default")
+        print(f"[config] system_prompt not in DB for agent_id={agent_id} — using default")
         return _DEFAULT_SYSTEM_PROMPT
     return prompt
+
+
+# UPGRADE #19: resolve which agent_id owns an inbound/outbound number.
+# Cached briefly since the phone->agent mapping changes rarely.
+_PHONE_MAP_CACHE: Dict[str, str] = {}
+_PHONE_MAP_CACHE_TS: float = 0.0
+_PHONE_MAP_TTL = 300.0  # 5 min - mapping changes rarely, ok to lag briefly
+
+def _fetch_phone_map_sync() -> Dict[str, str]:
+    rows = (
+        _get_supabase()
+        .table("agents")
+        .select("agent_id, phone_number")
+        .eq("is_active", True)
+        .execute()
+        .data or []
+    )
+    return {r["phone_number"]: r["agent_id"] for r in rows if r.get("phone_number")}
+
+
+async def resolve_agent_id_for_number(to_number: Optional[str]) -> str:
+    global _PHONE_MAP_CACHE, _PHONE_MAP_CACHE_TS
+    if not to_number:
+        return DEFAULT_AGENT_ID
+    now = time.monotonic()
+    if not _PHONE_MAP_CACHE or (now - _PHONE_MAP_CACHE_TS) > _PHONE_MAP_TTL:
+        try:
+            _PHONE_MAP_CACHE    = await asyncio.to_thread(_fetch_phone_map_sync)
+            _PHONE_MAP_CACHE_TS = now
+        except Exception as e:
+            print(f"[phone_map] fetch failed, using stale/empty cache: {e}")
+    return _PHONE_MAP_CACHE.get(to_number, DEFAULT_AGENT_ID)
 
 # ── lifespan ──────────────────────────────────────────────────
 
@@ -127,9 +188,10 @@ async def lifespan(app: FastAPI):
     )
     print("[startup] Supabase client ready")
     try:
-        await get_agent_config(force=True)
-        prompt_preview = (await get_system_prompt())[:80].replace("\n", " ")
-        print(f"[startup] system_prompt loaded: '{prompt_preview}…'")
+        await get_agent_config(DEFAULT_AGENT_ID, force=True)
+        prompt_preview = (await get_system_prompt(DEFAULT_AGENT_ID))[:80].replace("\n", " ")
+        print(f"[startup] default system_prompt loaded: '{prompt_preview}…'")
+        await resolve_agent_id_for_number(None)  # warms phone map cache
     except Exception as e:
         print(f"[startup] config pre-warm failed: {e}")
 
@@ -146,7 +208,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,   # CHANGED: was hardcoded ["*"] — now env-driven, defaults to "*" if unset
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -157,6 +219,47 @@ def _get_supabase() -> Client:
     if supabase is None:
         raise RuntimeError("Supabase client not initialised yet")
     return supabase
+
+# ── NEW: UPGRADE #15 — Telnyx webhook signature verification ──
+# Same Ed25519 + timestamp-freshness pattern used in server.py's
+# /telnyx/voice handler. No-ops (accepts everything) if
+# TELNYX_PUBLIC_KEY is not set, matching server.py's behavior.
+
+async def _verify_telnyx_signature(request: Request) -> bytes:
+    """
+    Returns the raw request body bytes if verification passes
+    (or is disabled). Raises HTTPException(403) if verification
+    is enabled and fails.
+    """
+    body = await request.body()
+
+    if not TELNYX_PUBLIC_KEY:
+        return body
+
+    from fastapi import HTTPException as _HTTPException
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    sig       = request.headers.get("telnyx-signature-ed25519", "")
+    timestamp = request.headers.get("telnyx-timestamp", "")
+
+    try:
+        ts_val = float(timestamp)
+    except (TypeError, ValueError):
+        raise _HTTPException(status_code=403, detail="Missing or invalid Telnyx timestamp")
+
+    if abs(time.time() - ts_val) > WEBHOOK_TIMESTAMP_SKEW_S:
+        raise _HTTPException(status_code=403, detail="Stale Telnyx webhook timestamp")
+
+    try:
+        pub_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(TELNYX_PUBLIC_KEY))
+        pub_key.verify(base64.b64decode(sig), (timestamp + "|").encode() + body)
+    except _HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[telnyx-webhook] signature verify failed: {exc}")
+        raise _HTTPException(status_code=403, detail="Invalid Telnyx signature")
+
+    return body
 
 # ═══════════════════════════════════════════════════════════════
 # UPGRADE #13: Telnyx webhook  POST /telnyx-webhook
@@ -203,8 +306,11 @@ async def telnyx_webhook(request: Request, background_tasks: BackgroundTasks):
       - call.completed        → fetch recording via API
     All other events return 200 immediately (Telnyx requires ACK).
     """
+    # NEW: UPGRADE #15 — verify signature before trusting the body at all.
+    raw_body = await _verify_telnyx_signature(request)
+
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception:
         return JSONResponse({"status": "bad_request"}, status_code=400)
 
@@ -255,11 +361,22 @@ async def telnyx_webhook(request: Request, background_tasks: BackgroundTasks):
         duration_sec = int(payload.get("duration_secs", 0))
 
         async def _delayed_pipeline():
-            # Small delay — Telnyx may not have processed recording yet
+            # Small initial delay — Telnyx may not have processed recording yet
             await asyncio.sleep(5)
-            recording_url = await _fetch_telnyx_recording(call_control_id)
+
+            # CHANGED: UPGRADE #16 — retry with backoff instead of a single
+            # fetch attempt. Was: one shot, silent skip on miss.
+            recording_url = ""
+            for attempt in range(RECORDING_FETCH_RETRIES):
+                if attempt:
+                    await asyncio.sleep(RECORDING_FETCH_BACKOFF_S * attempt)
+                recording_url = await _fetch_telnyx_recording(call_control_id)
+                if recording_url:
+                    break
+                print(f"[telnyx-webhook] recording not ready, attempt {attempt + 1}/{RECORDING_FETCH_RETRIES}")
+
             if not recording_url:
-                print(f"[telnyx-webhook] no recording for {call_control_id} — skipping pipeline")
+                print(f"[telnyx-webhook] no recording for {call_control_id} after {RECORDING_FETCH_RETRIES} attempts — skipping pipeline")
                 return
             call_meta = {
                 "call_sid":      call_control_id,
@@ -494,6 +611,9 @@ async def save_record(record: Dict[str, Any]) -> None:
     meta      = record.get("meta", {})
     extracted = record.get("extracted", {})
 
+    # UPGRADE #19: tag which agent handled this call for per-agent reporting
+    agent_id = await resolve_agent_id_for_number(meta.get("to_number"))
+
     row = {
         "call_sid":      record["call_sid"],
         "from_number":   meta.get("from_number"),
@@ -507,6 +627,7 @@ async def save_record(record: Dict[str, Any]) -> None:
         "source":        meta.get("source", "Unknown"),
         "name":          extracted.get("name", ""),
         "company":       extracted.get("company", ""),   # UPGRADE #14 side-effect
+        "agent_id":      agent_id,
     }
 
     try:
@@ -549,6 +670,42 @@ def _load_transcript_sync(call_sid: str) -> Optional[Dict[str, Any]]:
         .execute()
     )
     return res.data
+
+
+# ── NEW: UPGRADE #18 — live-call facts from server.py ───────
+# Writes to dedicated live_* columns only, so this never collides
+# with the post-call pipeline's columns (transcript, extracted,
+# lead_category, etc). call_handler.py remains the only writer
+# to Supabase — server.py never touches the DB directly.
+#
+# Requires these columns to exist on the "calls" table:
+#   live_facts       jsonb
+#   live_outcome     text
+#   live_history     jsonb
+#   live_updated_at  timestamptz
+
+def _save_live_facts_sync(row: Dict[str, Any]) -> None:
+    _get_supabase().table("calls").upsert(row, on_conflict="call_sid").execute()
+
+
+async def save_live_facts(
+    call_sid: str,
+    facts:    Dict[str, Any],
+    outcome:  Optional[str],
+    history:  List[Dict[str, str]],
+) -> None:
+    row = {
+        "call_sid":        call_sid,
+        "live_facts":      facts,
+        "live_outcome":    outcome,
+        "live_history":    history,
+        "live_updated_at": datetime.utcnow().isoformat(),
+    }
+    try:
+        await asyncio.to_thread(_save_live_facts_sync, row)
+        print(f"[storage] live facts saved for {call_sid}")
+    except Exception as e:
+        print(f"[storage] live facts save error for {call_sid}: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # N8N HOT LEAD TRIGGER
@@ -713,8 +870,8 @@ async def get_transcript(call_sid: str):
 # ═══════════════════════════════════════════════════════════════
 
 @app.get("/api/config")
-async def get_config():
-    cfg = await get_agent_config()
+async def get_config(agent_id: str = DEFAULT_AGENT_ID):
+    cfg = await get_agent_config(agent_id)
 
     # Keys safe to expose to server.py (never expose service role creds)
     safe_keys = {
@@ -723,6 +880,7 @@ async def get_config():
         "lead_name",    # UPGRADE #14: server.py uses this for greeting + recovery memory
     }
     filtered = {k: v for k, v in cfg.items() if k in safe_keys}
+    filtered["agent_id"] = agent_id
 
     # lead_name fallback: if not in agent_config table, check env
     # (useful when set per-campaign via environment variable)
@@ -735,9 +893,128 @@ async def get_config():
 
 
 @app.post("/api/config/refresh")
-async def refresh_config():
-    await get_agent_config(force=True)
-    return JSONResponse({"status": "ok", "keys": list(_CONFIG_CACHE.keys())})
+async def refresh_config(agent_id: Optional[str] = None):
+    # No agent_id -> refresh every agent currently cached (cheap: just re-fetches
+    # per-agent rows already known about, not a full table scan per agent).
+    if agent_id:
+        await get_agent_config(agent_id, force=True)
+        return JSONResponse({"status": "ok", "agent_id": agent_id, "keys": list(_CONFIG_CACHE.get(agent_id, {}).keys())})
+
+    for aid in list(_CONFIG_CACHE.keys()) or [DEFAULT_AGENT_ID]:
+        await get_agent_config(aid, force=True)
+    return JSONResponse({"status": "ok", "agents_refreshed": list(_CONFIG_CACHE.keys())})
+
+
+# ═══════════════════════════════════════════════════════════════
+# UPGRADE #19: agent registry — list/create/update/delete agents,
+# and resolve which agent owns an inbound Telnyx number.
+# Dashboard's Agent Prompt page uses these (or reads/writes Supabase
+# directly — either works since RLS/service-role key governs access).
+# ═══════════════════════════════════════════════════════════════
+
+_DEFAULT_AGENT_CONFIG_KEYS = ("system_prompt", "agent_name", "lead_name")
+
+@app.get("/api/agents")
+async def list_agents():
+    rows = await asyncio.to_thread(
+        lambda: _get_supabase().table("agents").select("*").order("created_at").execute().data or []
+    )
+    return JSONResponse({"agents": rows})
+
+
+@app.post("/api/agents")
+async def upsert_agent(request: Request):
+    body = await request.json()
+    agent_id = (body.get("agent_id") or "").strip()
+    name     = (body.get("name") or "").strip()
+    if not agent_id or not name:
+        raise HTTPException(status_code=400, detail="agent_id and name are required")
+
+    phone_number = (body.get("phone_number") or "").strip() or None
+    now = datetime.utcnow().isoformat()
+
+    def _upsert():
+        _get_supabase().table("agents").upsert({
+            "agent_id":     agent_id,
+            "name":         name,
+            "phone_number": phone_number,
+            "is_active":    body.get("is_active", True),
+            "updated_at":   now,
+        }, on_conflict="agent_id").execute()
+
+        # seed empty config rows for a brand-new agent so the prompt page
+        # has something to edit immediately (no-op if rows already exist,
+        # since we only insert keys that are missing)
+        existing = (
+            _get_supabase().table("agent_config")
+            .select("key").eq("agent_id", agent_id).execute().data or []
+        )
+        existing_keys = {r["key"] for r in existing}
+        seed_rows = [
+            {"agent_id": agent_id, "key": k, "value": "", "updated_at": now}
+            for k in _DEFAULT_AGENT_CONFIG_KEYS if k not in existing_keys
+        ]
+        if seed_rows:
+            _get_supabase().table("agent_config").insert(seed_rows).execute()
+
+    await asyncio.to_thread(_upsert)
+    _PHONE_MAP_CACHE.clear()  # force phone routing refresh on next call
+    return JSONResponse({"status": "ok", "agent_id": agent_id})
+
+
+@app.delete("/api/agents/{agent_id}")
+async def delete_agent(agent_id: str):
+    if agent_id == DEFAULT_AGENT_ID:
+        raise HTTPException(status_code=400, detail="cannot delete the default agent")
+
+    def _delete():
+        _get_supabase().table("agents").delete().eq("agent_id", agent_id).execute()
+        _get_supabase().table("agent_config").delete().eq("agent_id", agent_id).execute()
+
+    await asyncio.to_thread(_delete)
+    _CONFIG_CACHE.pop(agent_id, None)
+    _CONFIG_CACHE_TS.pop(agent_id, None)
+    _PHONE_MAP_CACHE.clear()
+    return JSONResponse({"status": "ok", "deleted": agent_id})
+
+
+@app.get("/api/agent-for-number")
+async def agent_for_number(to: str):
+    agent_id = await resolve_agent_id_for_number(to)
+    return JSONResponse({"to": to, "agent_id": agent_id})
+
+
+# ═══════════════════════════════════════════════════════════════
+# NEW: UPGRADE #18 — /api/call-live-facts
+# Receives live-call facts/history/outcome from server.py so that
+# in-call data isn't lost when a call drops before the post-call
+# recording pipeline runs (or if that pipeline fails/is delayed).
+# call_handler.py performs the actual Supabase write — server.py
+# never gets a Supabase client, keeping this file the single writer.
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/api/call-live-facts")
+async def post_call_live_facts(request: Request):
+    if INTERNAL_API_KEY:
+        provided = request.headers.get("X-Internal-Key", "")
+        if provided != INTERNAL_API_KEY:
+            raise HTTPException(status_code=403, detail="Invalid internal API key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "bad_request"}, status_code=400)
+
+    call_sid = body.get("call_sid", "")
+    if not call_sid:
+        return JSONResponse({"status": "bad_request", "reason": "call_sid required"}, status_code=400)
+
+    facts   = body.get("facts", {}) or {}
+    outcome = body.get("outcome")
+    history = body.get("history", []) or []
+
+    await save_live_facts(call_sid, facts, outcome, history)
+    return JSONResponse({"status": "ok", "call_sid": call_sid})
 
 
 @app.get("/health")
@@ -750,12 +1027,13 @@ async def health():
     except Exception:
         count = -1
 
-    cfg = await get_agent_config()
+    cfg = await get_agent_config(DEFAULT_AGENT_ID)
 
     return JSONResponse({
         "status":             "ok",
         "calls_stored":       count,
         "config_keys_loaded": list(cfg.keys()),
+        "agents_cached":      list(_CONFIG_CACHE.keys()),
         "timestamp":          datetime.utcnow().isoformat(),
     })
 
