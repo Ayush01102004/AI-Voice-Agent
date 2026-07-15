@@ -1,10 +1,10 @@
 """
 call_handler.py  —  FastAPI + Supabase
-Telnyx webhook receiver + transcription + lead extraction + N8N trigger
+Plivo webhook receiver + transcription + lead extraction + N8N trigger
 
 Run:
-  pip install fastapi uvicorn httpx groq python-dotenv supabase
-  uvicorn call_handler:app --host 0.0.0.0 --port 8000 --reload
+  pip install fastapi uvicorn httpx groq python-dotenv supabase plivo resend
+  uvicorn call_handler:app --host 0.0.0.0 --port 8000 --reload --log-level warning --no-access-log
 
 Upgrades vs v3.2.0:
   8.  source field written to calls table         [Top Sources chart support]
@@ -21,11 +21,24 @@ Upgrades vs v3.4.0:
   17. CORS origins now env-configurable             [was allow_origins=["*"] hardcoded]
   18. /api/call-live-facts endpoint                  [receives server.py's live-call facts/history,
                                                        so call_handler.py stays the single DB writer]
+
+Upgrades vs v3.5.0 — Plivo migration:
+  19. Telnyx webhook/signature replaced by Plivo    [POST /plivo/recording, X-Plivo-Signature-V3]
+  20. GET  /api/plivo/numbers                       [list rented numbers + which agent owns each]
+  21. POST /api/plivo/link-number                   [bind a number to an agent: Plivo Application
+                                                       + agents.phone_number, one call from the dashboard]
+
+Upgrades vs v3.6.0 — Forms email, no OAuth:
+  22. POST /api/send-form-email                     [Resend-based transactional send, replaces
+                                                       Gmail OAuth — zero setup for end users,
+                                                       single admin-side API key, real delivery
+                                                       status logged to form_send_log]
 """
 
 import asyncio
 import base64
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -33,6 +46,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
+import plivo
+import resend
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,37 +59,48 @@ from supabase import create_client, Client
 
 load_dotenv()
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("call_handler")
+logging.getLogger("httpx").setLevel(logging.WARNING)   # silence per-request noise
+logging.getLogger("hpack").setLevel(logging.WARNING)
+
 DEEPGRAM_API_KEY          = os.getenv("DEEPGRAM_API_KEY", "")
 GROQ_API_KEY              = os.getenv("GROQ_API_KEY", "")
 N8N_WEBHOOK_URL           = os.getenv("N8N_WEBHOOK_URL", "")
 SUPABASE_URL              = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-TELNYX_API_KEY            = os.getenv("TELNYX_API_KEY", "")   # UPGRADE #13
-TELNYX_PUBLIC_KEY         = os.getenv("TELNYX_PUBLIC_KEY", "")  # NEW: UPGRADE #15
-INTERNAL_API_KEY          = os.getenv("INTERNAL_API_KEY", "")   # NEW: UPGRADE #18 — shared secret for server.py → call_handler.py calls
+PLIVO_AUTH_ID             = os.getenv("PLIVO_AUTH_ID", "")        # UPGRADE #19
+PLIVO_AUTH_TOKEN          = os.getenv("PLIVO_AUTH_TOKEN", "")     # UPGRADE #19
+PLIVO_ANSWER_URL          = os.getenv("PLIVO_ANSWER_URL", "")     # e.g. https://<server.py-domain>/plivo/answer
+PLIVO_APP_NAME            = os.getenv("PLIVO_APP_NAME", "ai-voice-agent")  # shared Application, one for all agents/numbers
+INTERNAL_API_KEY          = os.getenv("INTERNAL_API_KEY", "")   # shared secret for server.py → call_handler.py calls
+RESEND_API_KEY            = os.getenv("RESEND_API_KEY", "")     # UPGRADE #22 — Forms page email send
+RESEND_FROM_EMAIL         = os.getenv("RESEND_FROM_EMAIL", "Inbox Infotech <onboarding@resend.dev>")
 ALLOWED_ORIGINS           = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
-]  # NEW: UPGRADE #17
+]
 
 for name, val in [
     ("DEEPGRAM_API_KEY",          DEEPGRAM_API_KEY),
     ("GROQ_API_KEY",              GROQ_API_KEY),
     ("SUPABASE_URL",              SUPABASE_URL),
     ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY),
+    ("PLIVO_AUTH_ID",             PLIVO_AUTH_ID),
+    ("PLIVO_AUTH_TOKEN",          PLIVO_AUTH_TOKEN),
 ]:
     if not val:
         raise ValueError(f"{name} missing from .env")
 
-groq_client: AsyncGroq       = AsyncGroq(api_key=GROQ_API_KEY)
-supabase:    Optional[Client] = None
+groq_client:  AsyncGroq       = AsyncGroq(api_key=GROQ_API_KEY)
+supabase:     Optional[Client] = None
+plivo_client: plivo.RestClient = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
 
-# ── NEW: UPGRADE #15/#16 constants ───────────────────────────
-
-WEBHOOK_TIMESTAMP_SKEW_S     = 300.0  # reject Telnyx webhook timestamps older than this
-RECORDING_FETCH_RETRIES      = 3
-RECORDING_FETCH_BACKOFF_S    = 4.0    # multiplied by attempt number, on top of the initial 5s wait
-
-# ── UPGRADE #12: agent_config cache ──────────────────────────
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY   
 
 _CONFIG_CACHE:    Dict[str, Dict[str, str]] = {}   # {agent_id: {key: value}}
 _CONFIG_CACHE_TS: Dict[str, float] = {}             # {agent_id: monotonic_ts}
@@ -116,11 +142,6 @@ def _fetch_agent_config_sync(agent_id: str) -> Dict[str, str]:
     )
     return {r["key"]: r["value"] for r in rows}
 
-
-# UPGRADE #19: config cache is now keyed per agent_id (multi-agent support).
-# _CONFIG_CACHE / _CONFIG_CACHE_TS are dicts: {agent_id: {...}} / {agent_id: ts}
-# so each agent's prompt/name/etc refreshes independently and one agent's
-# cache miss never forces a refetch of the other nine.
 async def get_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = False) -> Dict[str, str]:
     global _CONFIG_CACHE, _CONFIG_CACHE_TS
     now = time.monotonic()
@@ -131,9 +152,9 @@ async def get_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = False
             cfg = await asyncio.to_thread(_fetch_agent_config_sync, agent_id)
             _CONFIG_CACHE[agent_id]    = cfg
             _CONFIG_CACHE_TS[agent_id] = now
-            print(f"[config] refreshed agent_id={agent_id} — {len(cfg)} keys")
+            logger.debug("Config refreshed — agent_id=%s keys=%d", agent_id, len(cfg))
         except Exception as e:
-            print(f"[config] fetch failed for agent_id={agent_id}, using cache/defaults: {e}")
+            logger.warning("Config fetch failed — agent_id=%s using cache/defaults: %s", agent_id, e)
     return _CONFIG_CACHE.get(agent_id, {})
 
 
@@ -141,27 +162,24 @@ async def get_system_prompt(agent_id: str = DEFAULT_AGENT_ID) -> str:
     cfg    = await get_agent_config(agent_id)
     prompt = cfg.get("system_prompt", "").strip()
     if not prompt:
-        print(f"[config] system_prompt not in DB for agent_id={agent_id} — using default")
+        logger.debug("No system_prompt in DB — agent_id=%s using default", agent_id)
         return _DEFAULT_SYSTEM_PROMPT
     return prompt
 
-
-# UPGRADE #19: resolve which agent_id owns an inbound/outbound number.
-# Cached briefly since the phone->agent mapping changes rarely.
 _PHONE_MAP_CACHE: Dict[str, str] = {}
 _PHONE_MAP_CACHE_TS: float = 0.0
 _PHONE_MAP_TTL = 300.0  # 5 min - mapping changes rarely, ok to lag briefly
 
 def _fetch_phone_map_sync() -> Dict[str, str]:
+ 
     rows = (
         _get_supabase()
-        .table("agents")
-        .select("agent_id, phone_number")
-        .eq("is_active", True)
+        .table("agent_numbers")
+        .select("number, agent_id")
         .execute()
         .data or []
     )
-    return {r["phone_number"]: r["agent_id"] for r in rows if r.get("phone_number")}
+    return {r["number"]: r["agent_id"] for r in rows if r.get("number")}
 
 
 async def resolve_agent_id_for_number(to_number: Optional[str]) -> str:
@@ -174,7 +192,7 @@ async def resolve_agent_id_for_number(to_number: Optional[str]) -> str:
             _PHONE_MAP_CACHE    = await asyncio.to_thread(_fetch_phone_map_sync)
             _PHONE_MAP_CACHE_TS = now
         except Exception as e:
-            print(f"[phone_map] fetch failed, using stale/empty cache: {e}")
+            logger.warning("Phone map fetch failed, using stale/empty cache: %s", e)
     return _PHONE_MAP_CACHE.get(to_number, DEFAULT_AGENT_ID)
 
 # ── lifespan ──────────────────────────────────────────────────
@@ -186,17 +204,17 @@ async def lifespan(app: FastAPI):
         supabase_url=SUPABASE_URL,
         supabase_key=SUPABASE_SERVICE_ROLE_KEY,
     )
-    print("[startup] Supabase client ready")
+    logger.info("Supabase client initialised")
     try:
         await get_agent_config(DEFAULT_AGENT_ID, force=True)
         prompt_preview = (await get_system_prompt(DEFAULT_AGENT_ID))[:80].replace("\n", " ")
-        print(f"[startup] default system_prompt loaded: '{prompt_preview}…'")
+        logger.info("Startup complete — default agent config loaded")
         await resolve_agent_id_for_number(None)  # warms phone map cache
     except Exception as e:
-        print(f"[startup] config pre-warm failed: {e}")
+        logger.error("Startup config pre-warm failed: %s", e)
 
     yield
-    print("[shutdown] clean exit")
+    logger.info("Shutdown complete")
 
 # ── app ───────────────────────────────────────────────────────
 
@@ -219,228 +237,101 @@ def _get_supabase() -> Client:
     if supabase is None:
         raise RuntimeError("Supabase client not initialised yet")
     return supabase
+def _with_retry(fn, *args, retries: int = 2, delay: float = 0.15, **kwargs):
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except (httpx.ReadError, httpx.RemoteProtocolError, ConnectionError) as e:
+            last_exc = e
+            if attempt < retries:
+                logger.debug("Transient Supabase read error, retry %d/%d: %s", attempt + 1, retries, e)
+                time.sleep(delay)
+            else:
+                logger.warning("Supabase call failed after %d retries: %s", retries, e)
+    raise last_exc
 
-# ── NEW: UPGRADE #15 — Telnyx webhook signature verification ──
-# Same Ed25519 + timestamp-freshness pattern used in server.py's
-# /telnyx/voice handler. No-ops (accepts everything) if
-# TELNYX_PUBLIC_KEY is not set, matching server.py's behavior.
+async def _verify_plivo_signature(request: Request) -> Dict[str, str]:
+    form   = await request.form()
+    params = dict(form)
 
-async def _verify_telnyx_signature(request: Request) -> bytes:
-    """
-    Returns the raw request body bytes if verification passes
-    (or is disabled). Raises HTTPException(403) if verification
-    is enabled and fails.
-    """
-    body = await request.body()
+    signature = request.headers.get("X-Plivo-Signature-V3", "")
+    nonce     = request.headers.get("X-Plivo-Signature-V3-Nonce", "")
 
-    if not TELNYX_PUBLIC_KEY:
-        return body
+    if not signature or not nonce:
+        raise HTTPException(status_code=403, detail="Missing Plivo signature headers")
 
-    from fastapi import HTTPException as _HTTPException
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-    sig       = request.headers.get("telnyx-signature-ed25519", "")
-    timestamp = request.headers.get("telnyx-timestamp", "")
-
+    url = str(request.url)
     try:
-        ts_val = float(timestamp)
-    except (TypeError, ValueError):
-        raise _HTTPException(status_code=403, detail="Missing or invalid Telnyx timestamp")
-
-    if abs(time.time() - ts_val) > WEBHOOK_TIMESTAMP_SKEW_S:
-        raise _HTTPException(status_code=403, detail="Stale Telnyx webhook timestamp")
-
-    try:
-        pub_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(TELNYX_PUBLIC_KEY))
-        pub_key.verify(base64.b64decode(sig), (timestamp + "|").encode() + body)
-    except _HTTPException:
-        raise
+        valid = plivo.utils.validate_v3_signature(
+            "POST", url, nonce, PLIVO_AUTH_TOKEN, signature, params
+        )
     except Exception as exc:
-        print(f"[telnyx-webhook] signature verify failed: {exc}")
-        raise _HTTPException(status_code=403, detail="Invalid Telnyx signature")
+        logger.warning("Plivo signature verification error: %s", exc)
+        raise HTTPException(status_code=403, detail="Signature verification error")
 
-    return body
+    if not valid:
+        raise HTTPException(status_code=403, detail="Invalid Plivo signature")
 
-# ═══════════════════════════════════════════════════════════════
-# UPGRADE #13: Telnyx webhook  POST /telnyx-webhook
-# Replaces /twilio-webhook.
-#
-# Telnyx sends call.completed events via HTTP webhooks (JSON body).
-# Recording URL comes from a separate call.recording.saved event
-# or the Telnyx Call Control API; here we handle both patterns:
-#   a) call.recording.saved  → has recording_url directly
-#   b) call.completed        → fetch recording from Telnyx API
-# ═══════════════════════════════════════════════════════════════
-
-async def _fetch_telnyx_recording(call_control_id: str) -> str:
-    """
-    Query Telnyx API for the recording URL of a completed call.
-    Returns empty string if not found or API key missing.
-    """
-    if not TELNYX_API_KEY:
-        print("[telnyx] TELNYX_API_KEY not set — cannot fetch recording")
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"https://api.telnyx.com/v2/recordings?filter[call_control_id]={call_control_id}",
-                headers={"Authorization": f"Bearer {TELNYX_API_KEY}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json().get("data", [])
-                if data:
-                    url = data[0].get("download_urls", {}).get("mp3", "")
-                    print(f"[telnyx] recording URL fetched: {url[:60]}…")
-                    return url
-            print(f"[telnyx] recording fetch {resp.status_code}: {resp.text[:120]}")
-    except Exception as e:
-        print(f"[telnyx] recording fetch error: {e}")
-    return ""
+    return params
 
 
-@app.post("/telnyx-webhook")
-async def telnyx_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Handles two Telnyx event types:
-      - call.recording.saved  → recording URL available immediately
-      - call.completed        → fetch recording via API
-    All other events return 200 immediately (Telnyx requires ACK).
-    """
-    # NEW: UPGRADE #15 — verify signature before trusting the body at all.
-    raw_body = await _verify_telnyx_signature(request)
+@app.post("/plivo/recording")
+async def plivo_recording(request: Request, background_tasks: BackgroundTasks):
+    params = await _verify_plivo_signature(request)
 
-    try:
-        body = json.loads(raw_body)
-    except Exception:
-        return JSONResponse({"status": "bad_request"}, status_code=400)
+    call_uuid     = params.get("CallUUID", "")
+    # Plivo's Record action callback field name for the file URL —
+    # checked defensively across the couple of casings Plivo has used.
+    recording_url = params.get("RecordUrl") or params.get("RecordingUrl") or ""
+    duration_sec  = int(float(params.get("RecordingDuration", 0) or 0))
+    from_number   = params.get("From", "")
+    to_number     = params.get("To", "")
+    source        = request.headers.get("X-Lead-Source", "Outbound Call")
 
-    data      = body.get("data", {})
-    event_type = data.get("event_type", "")
-    payload   = data.get("payload", {})
+    agent_id_hint = request.query_params.get("agent_id", "")
 
-    call_control_id = payload.get("call_control_id", "")
-    call_leg_id     = payload.get("call_leg_id", call_control_id)
+    logger.info("Recording received — call_uuid=%s agent_id=%s", call_uuid, agent_id_hint or "unassigned")
 
-    # Source tag: N8N sets X-Lead-Source header when triggering outbound calls
-    source = request.headers.get("X-Lead-Source", "Outbound Call")
-
-    print(f"[telnyx-webhook] event={event_type} call_control_id={call_control_id}")
-
-    # ── call.recording.saved ──────────────────────────────────
-    if event_type == "call.recording.saved":
-        recording_url = (
-            payload.get("recording_urls", {}).get("mp3", "")
-            or payload.get("public_recording_urls", {}).get("mp3", "")
-        )
-        if not recording_url:
-            return JSONResponse({"status": "skipped", "reason": "no recording url"})
-
-        from_number  = payload.get("from", "")
-        to_number    = payload.get("to", "")
-        duration_sec = int(payload.get("duration_secs", 0))
-
-        call_meta = {
-            "call_sid":      call_control_id,
-            "from_number":   from_number,
-            "to_number":     to_number,
-            "duration_sec":  duration_sec,
-            "recording_url": recording_url,
-            "source":        source,
-            "received_at":   datetime.utcnow().isoformat(),
-        }
-        background_tasks.add_task(
-            process_recording_pipeline, call_control_id, recording_url, call_meta
-        )
-        print(f"[telnyx-webhook] queued pipeline for {call_control_id}")
-        return JSONResponse({"status": "received", "call_control_id": call_control_id})
-
-    # ── call.completed ────────────────────────────────────────
-    elif event_type == "call.completed":
-        from_number  = payload.get("from", "")
-        to_number    = payload.get("to", "")
-        duration_sec = int(payload.get("duration_secs", 0))
-
-        async def _delayed_pipeline():
-            # Small initial delay — Telnyx may not have processed recording yet
-            await asyncio.sleep(5)
-
-            # CHANGED: UPGRADE #16 — retry with backoff instead of a single
-            # fetch attempt. Was: one shot, silent skip on miss.
-            recording_url = ""
-            for attempt in range(RECORDING_FETCH_RETRIES):
-                if attempt:
-                    await asyncio.sleep(RECORDING_FETCH_BACKOFF_S * attempt)
-                recording_url = await _fetch_telnyx_recording(call_control_id)
-                if recording_url:
-                    break
-                print(f"[telnyx-webhook] recording not ready, attempt {attempt + 1}/{RECORDING_FETCH_RETRIES}")
-
-            if not recording_url:
-                print(f"[telnyx-webhook] no recording for {call_control_id} after {RECORDING_FETCH_RETRIES} attempts — skipping pipeline")
-                return
-            call_meta = {
-                "call_sid":      call_control_id,
-                "from_number":   from_number,
-                "to_number":     to_number,
-                "duration_sec":  duration_sec,
-                "recording_url": recording_url,
-                "source":        source,
-                "received_at":   datetime.utcnow().isoformat(),
-            }
-            await process_recording_pipeline(call_control_id, recording_url, call_meta)
-
-        background_tasks.add_task(_delayed_pipeline)
-        return JSONResponse({"status": "received", "call_control_id": call_control_id})
-
-    # ── all other events: ACK and ignore ─────────────────────
-    return JSONResponse({"status": "ok", "event": event_type})
-
-
-# ── Keep /twilio-webhook alive for legacy callers ─────────────
-@app.post("/twilio-webhook")
-async def twilio_webhook_legacy(request: Request, background_tasks: BackgroundTasks):
-    """Backwards-compat shim — delegates to same pipeline."""
-    form = await request.form()
-    body = dict(form)
-
-    call_sid      = body.get("CallSid", "")
-    status        = body.get("CallStatus", "")
-    recording_url = body.get("RecordingUrl", "")
-    duration      = int(body.get("CallDuration", 0))
-    from_number   = body.get("From", "")
-    to_number     = body.get("To", "")
-    source        = request.headers.get("X-Lead-Source", "Inbound Call")
-
-    print(f"[twilio-legacy] call_sid={call_sid} status={status}")
-
-    if status != "completed":
-        return JSONResponse({"status": "skipped", "reason": f"status={status}"})
-    if not call_sid or not recording_url:
-        return JSONResponse({"status": "skipped", "reason": "missing fields"})
-
-    if not recording_url.endswith(".mp3"):
-        recording_url += ".mp3"
+    if not call_uuid or not recording_url:
+        return JSONResponse({"status": "skipped", "reason": "missing call_uuid or recording url"})
 
     call_meta = {
-        "call_sid":      call_sid,
+        "call_sid":      call_uuid,
         "from_number":   from_number,
         "to_number":     to_number,
-        "duration_sec":  duration,
+        "duration_sec":  duration_sec,
         "recording_url": recording_url,
         "source":        source,
+        "agent_id_hint": agent_id_hint,
         "received_at":   datetime.utcnow().isoformat(),
     }
-    background_tasks.add_task(
-        process_recording_pipeline, call_sid, recording_url, call_meta
-    )
-    return JSONResponse({"status": "received", "call_sid": call_sid})
+    background_tasks.add_task(process_recording_pipeline, call_uuid, recording_url, call_meta)
+    return JSONResponse({"status": "received", "call_uuid": call_uuid})
+
+
+@app.post("/plivo/stream-status")
+async def plivo_stream_status(request: Request):
+    """Informational only — Plivo's <Stream statusCallbackUrl> pings this
+    on stream start/stop. No DB write needed; the recording callback above
+    is the authoritative source for the finished-call pipeline. Kept as a
+    real endpoint (not a 404) purely so Plivo's callback retries don't pile
+    up warnings in the Plivo console."""
+    try:
+        params = await _verify_plivo_signature(request)
+        logger.debug("Stream status: %s", params.get("StreamEvent", params))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Stream status parse error: %s", e)
+    return JSONResponse({"status": "ok"})
 
 # ═══════════════════════════════════════════════════════════════
 # TRANSCRIPTION
 # ═══════════════════════════════════════════════════════════════
 
 async def transcribe_recording(audio_bytes: bytes) -> str:
-    print(f"[transcribe] sending {len(audio_bytes):,} bytes")
+    logger.debug("Sending %d bytes to Deepgram", len(audio_bytes))
 
     async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(
@@ -454,7 +345,7 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
         )
 
     if response.status_code != 200:
-        print(f"[transcribe] failed {response.status_code}: {response.text[:200]}")
+        logger.error("Transcription failed (%d): %s", response.status_code, response.text[:200])
         return ""
 
     data = response.json()
@@ -492,7 +383,7 @@ async def transcribe_recording(audio_bytes: bytes) -> str:
         lines.append(f"{label}: {' '.join(current_words)}")
 
     transcript = "\n".join(lines)
-    print(f"[transcribe] done — {len(lines)} turns")
+    logger.debug("Transcription complete — %d turns", len(lines))
     return transcript
 
 # ═══════════════════════════════════════════════════════════════
@@ -592,11 +483,11 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
         company = str(extracted.get("company", "")).strip()
         extracted["company"] = company if company.lower() not in ("", "unknown", "n/a", "none") else ""
 
-        print(f"[extract] {call_sid} → {extracted['lead_category']} score={extracted['lead_score']} name='{extracted['name']}' company='{extracted['company']}'")
+        logger.info("Lead extracted — call_sid=%s category=%s score=%s", call_sid, extracted["lead_category"], extracted["lead_score"])
         return extracted
 
     except Exception as e:
-        print(f"[extract] failed: {e}")
+        logger.error("Lead extraction failed: %s", e)
         return {**_COLD_FALLBACK, "summary": "Extraction failed.", "next_action": "Manual review required."}
 
 # ═══════════════════════════════════════════════════════════════
@@ -604,21 +495,36 @@ async def extract_insights(call_sid: str, transcript: str) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _save_record_sync(row: Dict[str, Any]) -> None:
-    _get_supabase().table("calls").upsert(row).execute()
+    _get_supabase().table("calls").upsert(row, on_conflict="call_sid").execute()
 
+
+def _safe_duration(raw: Any) -> float:
+    """duration_sec arrives as a raw float (time.monotonic() delta) from
+    server.py. Sending that straight into an `integer` Supabase column
+    throws error 22P02 ('invalid input syntax for type integer') and the
+    WHOLE upsert gets rejected — not just this field — which is why the
+    transcript/lead_category/lead_score never landed even though
+    /api/call-live-facts had already written a partial row moments
+    earlier. Coerce defensively regardless of the column's exact type."""
+    try:
+        return round(float(raw), 1)
+    except (TypeError, ValueError):
+        return 0.0
 
 async def save_record(record: Dict[str, Any]) -> None:
     meta      = record.get("meta", {})
     extracted = record.get("extracted", {})
 
-    # UPGRADE #19: tag which agent handled this call for per-agent reporting
-    agent_id = await resolve_agent_id_for_number(meta.get("to_number"))
+    # NEW: agent pool — trust the agent_id the call actually ran under
+    # (passed through from plivo_answer()'s pool pick) over a re-guess
+    # from to_number, since routing is no longer number-based.
+    agent_id = meta.get("agent_id_hint") or await resolve_agent_id_for_number(meta.get("to_number"))
 
     row = {
         "call_sid":      record["call_sid"],
         "from_number":   meta.get("from_number"),
         "to_number":     meta.get("to_number"),
-        "duration_sec":  meta.get("duration_sec", 0),
+        "duration_sec":  _safe_duration(meta.get("duration_sec", 0)),
         "transcript":    record.get("transcript", ""),
         "lead_category": extracted.get("lead_category", "COLD"),
         "lead_score":    extracted.get("lead_score", 1),
@@ -626,15 +532,15 @@ async def save_record(record: Dict[str, Any]) -> None:
         "recording_url": meta.get("recording_url", ""),
         "source":        meta.get("source", "Unknown"),
         "name":          extracted.get("name", ""),
-        "company":       extracted.get("company", ""),   # UPGRADE #14 side-effect
+        "company":       extracted.get("company", ""),   # UPGRADE #14 side-effect — schema now has this column
         "agent_id":      agent_id,
     }
 
     try:
         await asyncio.to_thread(_save_record_sync, row)
-        print(f"[storage] saved {record['call_sid']} to Supabase")
+        logger.debug("Call record saved — call_sid=%s", record["call_sid"])
     except Exception as e:
-        print(f"[storage] Supabase error: {e}")
+        logger.error("Supabase write failed: %s", e)
 
 
 def _load_records_sync(category: Optional[str], limit: int) -> List[Dict[str, Any]]:
@@ -672,18 +578,6 @@ def _load_transcript_sync(call_sid: str) -> Optional[Dict[str, Any]]:
     return res.data
 
 
-# ── NEW: UPGRADE #18 — live-call facts from server.py ───────
-# Writes to dedicated live_* columns only, so this never collides
-# with the post-call pipeline's columns (transcript, extracted,
-# lead_category, etc). call_handler.py remains the only writer
-# to Supabase — server.py never touches the DB directly.
-#
-# Requires these columns to exist on the "calls" table:
-#   live_facts       jsonb
-#   live_outcome     text
-#   live_history     jsonb
-#   live_updated_at  timestamptz
-
 def _save_live_facts_sync(row: Dict[str, Any]) -> None:
     _get_supabase().table("calls").upsert(row, on_conflict="call_sid").execute()
 
@@ -703,9 +597,9 @@ async def save_live_facts(
     }
     try:
         await asyncio.to_thread(_save_live_facts_sync, row)
-        print(f"[storage] live facts saved for {call_sid}")
+        logger.debug("Live facts saved — call_sid=%s", call_sid)
     except Exception as e:
-        print(f"[storage] live facts save error for {call_sid}: {e}")
+        logger.error("Live facts save failed — call_sid=%s: %s", call_sid, e)
 
 # ═══════════════════════════════════════════════════════════════
 # N8N HOT LEAD TRIGGER
@@ -717,7 +611,7 @@ async def trigger_hot_lead_workflow(
     meta:      Dict[str, Any],
 ) -> None:
     if not N8N_WEBHOOK_URL:
-        print("[n8n] webhook not configured — skipping")
+        logger.debug("N8N webhook not configured — skipping")
         return
 
     payload = {
@@ -743,9 +637,9 @@ async def trigger_hot_lead_workflow(
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(N8N_WEBHOOK_URL, json=payload)
-        print(f"[n8n] {resp.status_code} for {call_sid}")
+        logger.info("N8N workflow triggered — call_sid=%s status=%d", call_sid, resp.status_code)
     except Exception as e:
-        print(f"[n8n] failed: {e}")
+        logger.error("N8N trigger failed: %s", e)
 
 # ═══════════════════════════════════════════════════════════════
 # PIPELINE
@@ -756,16 +650,37 @@ async def process_recording_pipeline(
     recording_url: str,
     call_meta:     Dict[str, Any],
 ) -> None:
-    print(f"[pipeline] started {call_sid}")
+    logger.debug("Pipeline started — call_sid=%s", call_sid)
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(recording_url)
-            resp.raise_for_status()
-            audio_bytes = resp.content
-        print(f"[pipeline] downloaded {len(audio_bytes):,} bytes")
+        audio_bytes = None
+        last_err    = None
+        # Plivo's Record action fires the instant the call ends, but the
+        # mp3 isn't always finished processing/uploading on their media
+        # server yet — an immediate GET can 403 even with correct auth.
+        # Retry with backoff before giving up.
+        for attempt, delay in enumerate((0, 2, 4, 8)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.get(
+                        recording_url,
+                        auth=(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN),
+                    )
+                    resp.raise_for_status()
+                    audio_bytes = resp.content
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "Recording download attempt %d failed: %s", attempt + 1, e
+                )
+        if audio_bytes is None:
+            raise last_err
+        logger.debug("Recording downloaded — %d bytes", len(audio_bytes))
     except Exception as e:
-        print(f"[pipeline] download failed: {e}")
+        logger.error("Recording download failed: %s", e)
         return
 
     transcript = await transcribe_recording(audio_bytes)
@@ -779,10 +694,10 @@ async def process_recording_pipeline(
     })
 
     if extracted.get("lead_category") == "HOT":
-        print(f"[pipeline] HOT lead — triggering n8n")
+        logger.info("HOT lead — triggering N8N workflow")
         await trigger_hot_lead_workflow(call_sid, extracted, call_meta)
 
-    print(f"[pipeline] completed {call_sid}")
+    logger.debug("Pipeline completed — call_sid=%s", call_sid)
 
 # ═══════════════════════════════════════════════════════════════
 # API ENDPOINTS
@@ -802,7 +717,7 @@ async def get_leads(category: Optional[str] = None, limit: int = 100):
             "from_number":         r.get("from_number"),
             "to_number":           r.get("to_number"),
             "name":                r.get("name", ""),
-            "company":             r.get("company", ""),
+            "company":             (r.get("extracted") or {}).get("company", ""),
             "source":              r.get("source", "Unknown"),
             "duration_sec":        r.get("duration_sec"),
             "lead_category":       r.get("lead_category", "COLD"),
@@ -865,22 +780,38 @@ async def get_transcript(call_sid: str):
     return JSONResponse({"call_sid": call_sid, "transcript": parsed})
 
 
-# ═══════════════════════════════════════════════════════════════
-# UPGRADE #14: /api/config — expose lead_name for server.py
-# ═══════════════════════════════════════════════════════════════
+
+def _fetch_agent_profile_sync(agent_id: str) -> Dict[str, Optional[str]]:
+    """Name + phone live only on the `agents` table now — this is the single
+    source of truth server.py reads for the spoken agent name, so the
+    dashboard dropdown and what the agent says on calls can never disagree."""
+    row = (
+        _get_supabase()
+        .table("agents")
+        .select("name, phone_number")
+        .eq("agent_id", agent_id)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    return row or {}
+
 
 @app.get("/api/config")
 async def get_config(agent_id: str = DEFAULT_AGENT_ID):
-    cfg = await get_agent_config(agent_id)
+    cfg     = await get_agent_config(agent_id)
+    profile = await asyncio.to_thread(_fetch_agent_profile_sync, agent_id)
 
     # Keys safe to expose to server.py (never expose service role creds)
     safe_keys = {
-        "system_prompt", "agent_name", "company_name",
+        "system_prompt", "company_name",
         "calendly_link", "followup_delay", "notification_email",
         "lead_name",    # UPGRADE #14: server.py uses this for greeting + recovery memory
     }
     filtered = {k: v for k, v in cfg.items() if k in safe_keys}
-    filtered["agent_id"] = agent_id
+    filtered["agent_id"]      = agent_id
+    filtered["agent_name"]    = (profile.get("name") or "").strip() or "Assistant"
+    filtered["phone_number"]  = profile.get("phone_number")
 
     # lead_name fallback: if not in agent_config table, check env
     # (useful when set per-campaign via environment variable)
@@ -906,17 +837,14 @@ async def refresh_config(agent_id: Optional[str] = None):
 
 
 # ═══════════════════════════════════════════════════════════════
-# UPGRADE #19: agent registry — list/create/update/delete agents,
-# and resolve which agent owns an inbound Telnyx number.
-# Dashboard's Agent Prompt page uses these (or reads/writes Supabase
-# directly — either works since RLS/service-role key governs access).
 # ═══════════════════════════════════════════════════════════════
 
-_DEFAULT_AGENT_CONFIG_KEYS = ("system_prompt", "agent_name", "lead_name")
+_DEFAULT_AGENT_CONFIG_KEYS = ("system_prompt", "lead_name")
 
 @app.get("/api/agents")
 async def list_agents():
     rows = await asyncio.to_thread(
+        _with_retry,
         lambda: _get_supabase().table("agents").select("*").order("created_at").execute().data or []
     )
     return JSONResponse({"agents": rows})
@@ -978,10 +906,318 @@ async def delete_agent(agent_id: str):
     return JSONResponse({"status": "ok", "deleted": agent_id})
 
 
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+
+@app.patch("/api/agents/{agent_id}/toggle")
+async def toggle_agent(agent_id: str, request: Request):
+    body      = await request.json()
+    is_active = bool(body.get("is_active"))
+
+    def _update():
+        _get_supabase().table("agents").update({
+            "is_active":  is_active,
+            "updated_at": datetime.utcnow().isoformat(),
+        }).eq("agent_id", agent_id).execute()
+
+    await asyncio.to_thread(_update)
+    return JSONResponse({"status": "ok", "agent_id": agent_id, "is_active": is_active})
+
+
+@app.get("/api/agents/active-count")
+async def active_agent_count():
+    def _counts():
+        total  = _get_supabase().table("agents").select("agent_id", count="exact").execute()
+        active = _get_supabase().table("agents").select("agent_id", count="exact").eq("is_active", True).execute()
+        return (active.count or 0), (total.count or 0)
+
+    active_n, total_n = await asyncio.to_thread(_with_retry, _counts)
+    return JSONResponse({"count": active_n, "total": total_n})
+
+
+@app.get("/api/agents/active-ids")
+async def active_agent_ids():
+    """Feeds server.py's pick_agent_from_pool() — server.py has no direct
+    Supabase access (call_handler.py is the only DB reader/writer), so
+    this is the HTTP equivalent of the 'SELECT agent_id WHERE is_active'
+    query the pool picker needs, cached client-side same as /api/config."""
+    def _ids():
+        rows = _get_supabase().table("agents").select("agent_id").eq("is_active", True).execute().data or []
+        return [r["agent_id"] for r in rows]
+
+    ids = await asyncio.to_thread(_with_retry, _ids)
+    return JSONResponse({"agent_ids": ids})
+
+
 @app.get("/api/agent-for-number")
 async def agent_for_number(to: str):
-    agent_id = await resolve_agent_id_for_number(to)
+    # Distinguish "explicitly mapped to the default agent" from "no
+    # mapping exists" — resolve_agent_id_for_number() collapses both into
+    # the string "default", which made explicit links to that agent
+    # indistinguishable from an unmapped number. Check the phone map
+    # directly here so callers (server.py's pool-vs-explicit routing) can
+    # tell them apart via agent_id being null.
+    await resolve_agent_id_for_number(to)  # ensures _PHONE_MAP_CACHE is warm
+    agent_id = (
+        _PHONE_MAP_CACHE.get(to)
+        or _PHONE_MAP_CACHE.get(f"+{to}")
+        or _PHONE_MAP_CACHE.get(to.lstrip("+"))
+    )
     return JSONResponse({"to": to, "agent_id": agent_id})
+
+
+@app.get("/api/number-for-agent")
+async def number_for_agent(agent_id: str):
+    """Reverse of /api/agent-for-number: given an agent_id, return the
+    Plivo number assigned to it (agent_numbers), for use as the From/
+    caller-ID on outbound calls. If an agent owns multiple numbers,
+    returns the first found — assign a single dedicated outbound number
+    per agent if this matters for a given campaign."""
+    def _lookup():
+        rows = (
+            _get_supabase()
+            .table("agent_numbers")
+            .select("number")
+            .eq("agent_id", agent_id)
+            .limit(1)
+            .execute()
+            .data or []
+        )
+        return rows[0]["number"] if rows else None
+
+    number = await asyncio.to_thread(_with_retry, _lookup)
+    return JSONResponse({"agent_id": agent_id, "number": number})
+
+
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+
+_plivo_app_id_cache: Optional[str] = None
+
+async def _ensure_shared_application() -> str:
+    """Finds (or creates once) the single Plivo Application every rented
+    number gets bound to. Cached in-process after the first lookup."""
+    global _plivo_app_id_cache
+    if _plivo_app_id_cache:
+        return _plivo_app_id_cache
+
+    if not PLIVO_ANSWER_URL:
+        raise HTTPException(
+            status_code=500,
+            detail="PLIVO_ANSWER_URL not configured — set it to server.py's public /plivo/answer URL",
+        )
+
+    def _find_or_create() -> str:
+        existing = plivo_client.applications.list()
+        for app_obj in existing:
+            if getattr(app_obj, "app_name", None) == PLIVO_APP_NAME:
+                if getattr(app_obj, "answer_url", None) != PLIVO_ANSWER_URL:
+                    plivo_client.applications.update(
+                        app_id=app_obj.app_id,
+                        answer_url=PLIVO_ANSWER_URL,
+                        answer_method="POST",
+                    )
+                    logger.info("Plivo app answer_url updated — app_id=%s -> %s", app_obj.app_id, PLIVO_ANSWER_URL)
+                return app_obj.app_id
+        created = plivo_client.applications.create(
+            app_name=PLIVO_APP_NAME,
+            answer_url=PLIVO_ANSWER_URL,
+            answer_method="POST",
+        )
+        return created["app_id"]
+
+    app_id = await asyncio.to_thread(_find_or_create)
+    _plivo_app_id_cache = app_id
+    logger.info("Plivo shared application ready — app_id=%s", app_id)
+    return app_id
+
+
+@app.get("/api/plivo/numbers")
+async def list_plivo_numbers():
+    """Every number rented on this Plivo account, cross-referenced with
+    which agent (if any) currently owns it — powers the dashboard's
+    'available Plivo numbers' picker on the Agent Profiles page.
+
+    CHANGED: ownership now comes from agent_numbers (many numbers can
+    point at the same agent_id — e.g. an India DID and a US DID both
+    routed to "Alex" — agents.phone_number is no longer used for this)."""
+    def _list_all() -> List[Dict[str, Any]]:
+        out, offset = [], 0
+        while True:
+            page = plivo_client.numbers.list(limit=20, offset=offset)
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < 20:
+                break
+            offset += 20
+        return out
+
+    try:
+        numbers = await asyncio.to_thread(_with_retry, _list_all)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Plivo numbers.list failed: {e}")
+
+    def _load_ownership():
+        agent_numbers_rows = (
+            _get_supabase().table("agent_numbers").select("number, agent_id").execute().data or []
+        )
+        agents_rows = (
+            _get_supabase().table("agents").select("agent_id, name").execute().data or []
+        )
+        return agent_numbers_rows, agents_rows
+
+    agent_numbers_rows, agents_rows = await asyncio.to_thread(_with_retry, _load_ownership)
+    agent_name_by_id = {a["agent_id"]: a["name"] for a in agents_rows}
+    owner_agent_id_by_number = {r["number"]: r["agent_id"] for r in agent_numbers_rows}
+
+    result = []
+    for n in numbers:
+        number = getattr(n, "number", None) or n.get("number") if isinstance(n, dict) else getattr(n, "number", "")
+        owner_agent_id = owner_agent_id_by_number.get(number) or owner_agent_id_by_number.get(f"+{number}")
+        result.append({
+            "number":       number,
+            "region":       getattr(n, "region", None) or (n.get("region") if isinstance(n, dict) else None),
+            "voice_enabled": getattr(n, "voice_enabled", None) if not isinstance(n, dict) else n.get("voice_enabled"),
+            "monthly_rental_rate": getattr(n, "monthly_rental_rate", None) if not isinstance(n, dict) else n.get("monthly_rental_rate"),
+            "assigned_agent_id":   owner_agent_id,
+            "assigned_agent_name": agent_name_by_id.get(owner_agent_id) if owner_agent_id else None,
+        })
+
+    return JSONResponse({"numbers": result})
+
+
+@app.post("/api/plivo/link-number")
+async def link_plivo_number(request: Request):
+    """Bind a rented Plivo number to an agent: attaches the shared
+    Application to the number (so it actually routes calls to us) and
+    upserts agent_numbers. One call from the dashboard's Agent Profiles
+    page does both — no manual Plivo console steps.
+
+    CHANGED: writes agent_numbers (number is the primary key) instead of
+    agents.phone_number — this is what allows one agent to hold several
+    numbers while every number still resolves to exactly one agent. If
+    the number was previously assigned to a different agent, this call
+    reassigns it (upsert on the number PK, not an insert-only)."""
+    body     = await request.json()
+    agent_id = (body.get("agent_id") or "").strip()
+    number   = (body.get("number") or "").strip()
+    region   = (body.get("region") or "").strip() or None
+
+    if not agent_id or not number:
+        raise HTTPException(status_code=400, detail="agent_id and number are required")
+
+    app_id = await _ensure_shared_application()
+
+    def _bind():
+        plivo_client.numbers.update(number=number, app_id=app_id)
+
+    try:
+        await asyncio.to_thread(_bind)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Plivo number.update failed: {e}")
+
+    def _save():
+        _get_supabase().table("agent_numbers").upsert({
+            "number":      number,
+            "agent_id":    agent_id,
+            "region":      region,
+            "assigned_at": datetime.utcnow().isoformat(),
+        }, on_conflict="number").execute()
+
+    await asyncio.to_thread(_save)
+    _PHONE_MAP_CACHE.clear()   # routing cache is now stale — next call resolves fresh
+    logger.info("Number linked — number=%s agent_id=%s", number, agent_id)
+    return JSONResponse({"status": "ok", "agent_id": agent_id, "number": number})
+
+
+@app.post("/api/plivo/unlink-number")
+async def unlink_plivo_number(request: Request):
+    """Remove a number from whichever agent currently owns it. Leaves the
+    Plivo Application attached (so re-assigning later is instant) — only
+    the agent_numbers row is deleted."""
+    body   = await request.json()
+    number = (body.get("number") or "").strip()
+    if not number:
+        raise HTTPException(status_code=400, detail="number is required")
+
+    def _delete():
+        _get_supabase().table("agent_numbers").delete().eq("number", number).execute()
+
+    await asyncio.to_thread(_delete)
+    _PHONE_MAP_CACHE.clear()
+    logger.info("Number unlinked — number=%s", number)
+    return JSONResponse({"status": "ok", "number": number})
+
+
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+
+def _build_form_email_html(name: str, form_url: str) -> str:
+    safe_name = name or "there"
+    return f"""
+    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px">
+      <h2 style="color:#111">Hi {safe_name},</h2>
+      <p style="color:#555;font-size:15px;line-height:1.6">
+        Please fill out this quick form so we can understand your requirements better.
+      </p>
+      <a href="{form_url}"
+        style="display:inline-block;margin-top:8px;padding:12px 28px;background:#6366f1;
+               color:#fff;border-radius:8px;text-decoration:none;font-weight:600">
+        Open Form →
+      </a>
+      <p style="color:#aaa;font-size:12px;margin-top:24px">
+        Or copy: <a href="{form_url}">{form_url}</a>
+      </p>
+    </div>
+    """
+
+
+def _send_form_email_sync(to_email: str, name: str, form_url: str) -> Dict[str, Any]:
+    """Sync — always call via asyncio.to_thread. Raises on failure."""
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY not set on server — see .env setup notes")
+    return resend.Emails.send({
+        "from":    RESEND_FROM_EMAIL,
+        "to":      to_email,
+        "subject": "Quick Form – Help Us Understand Your Requirements",
+        "html":    _build_form_email_html(name, form_url),
+    })
+
+
+def _log_form_send(name: str, to_email: str, form_url: str, status: str,
+                    provider_id: Optional[str] = None, error: Optional[str] = None) -> None:
+    _get_supabase().table("form_send_log").insert({
+        "lead_name":   name,
+        "lead_email":  to_email,
+        "form_url":    form_url,
+        "sent_by":     "system",
+        "status":      status,
+        "provider_id": provider_id,
+        "error":       error,
+    }).execute()
+
+
+@app.post("/api/send-form-email")
+async def send_form_email_route(request: Request):
+    body     = await request.json()
+    to_email = (body.get("lead_email") or "").strip()
+    name     = (body.get("lead_name") or "").strip()
+    form_url = (body.get("form_url") or "").strip()
+
+    if not to_email or not form_url:
+        raise HTTPException(status_code=400, detail="lead_email and form_url are required")
+
+    try:
+        result      = await asyncio.to_thread(_send_form_email_sync, to_email, name, form_url)
+        provider_id = result.get("id") if isinstance(result, dict) else None
+        await asyncio.to_thread(_log_form_send, name, to_email, form_url, "sent", provider_id, None)
+        logger.info("Form email sent — to=%s provider_id=%s", to_email, provider_id)
+        return JSONResponse({"status": "ok", "provider_id": provider_id})
+    except Exception as e:
+        await asyncio.to_thread(_log_form_send, name, to_email, form_url, "failed", None, str(e))
+        logger.error("Form email send failed — to=%s: %s", to_email, e)
+        raise HTTPException(status_code=502, detail=f"Email send failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1017,6 +1253,89 @@ async def post_call_live_facts(request: Request):
     return JSONResponse({"status": "ok", "call_sid": call_sid})
 
 
+# ═══════════════════════════════════════════════════════════════
+# NEW — /api/call-transcript
+# Replaces the record-download-transcribe pipeline for the normal
+# case: server.py already has the full transcript as text (built
+# live from Deepgram's ConversationText events), so this skips
+# audio recording, download, and re-transcription entirely and
+# goes straight to Groq extraction + the same Supabase row shape
+# process_recording_pipeline() used to produce.
+# ═══════════════════════════════════════════════════════════════
+
+def format_transcript_from_history(history: List[Dict[str, str]]) -> str:
+    """Same "Agent: ..." / "Customer: ..." line shape transcribe_recording()
+    produced, so extract_insights()'s prompt sees a consistent format
+    whichever path a call came through."""
+    lines: List[str] = []
+    for turn in history:
+        role = (turn.get("role") or "").lower()
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        label = "Agent" if role == "assistant" else "Customer" if role == "user" else role.title()
+        lines.append(f"{label}: {text}")
+    return "\n".join(lines)
+
+
+@app.post("/api/call-transcript")
+async def post_call_transcript(request: Request, background_tasks: BackgroundTasks):
+    if INTERNAL_API_KEY:
+        provided = request.headers.get("X-Internal-Key", "")
+        if provided != INTERNAL_API_KEY:
+            raise HTTPException(status_code=403, detail="Invalid internal API key")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "bad_request"}, status_code=400)
+
+    call_sid = body.get("call_sid", "")
+    if not call_sid:
+        return JSONResponse({"status": "bad_request", "reason": "call_sid required"}, status_code=400)
+
+    history = body.get("history", []) or []
+    call_meta = {
+        "to_number":      body.get("to_number", ""),
+        "from_number":    body.get("from_number", ""),
+        "duration_sec":   body.get("duration_sec", 0),
+        "source":         body.get("source", "Plivo"),
+        "agent_id_hint":  body.get("agent_id", ""),
+    }
+
+    logger.info("Transcript received — call_sid=%s turns=%d", call_sid, len(history))
+    background_tasks.add_task(process_transcript_pipeline, call_sid, history, call_meta)
+    return JSONResponse({"status": "ok", "call_sid": call_sid})
+
+
+async def process_transcript_pipeline(
+    call_sid:  str,
+    history:   List[Dict[str, str]],
+    call_meta: Dict[str, Any],
+) -> None:
+    transcript = format_transcript_from_history(history)
+    if not transcript.strip():
+        logger.warning("Transcript pipeline skipped — empty transcript, call_sid=%s", call_sid)
+        return
+
+    extracted = await extract_insights(call_sid, transcript)
+
+    await save_record({
+        "call_sid":   call_sid,
+        "meta":       call_meta,
+        "transcript": transcript,
+        "extracted":  extracted,
+    })
+
+    # N8N hot-lead trigger disabled for now — no workflow configured yet,
+    # just testing the agent. Re-enable once N8N_WEBHOOK_URL is wired up.
+    # if extracted.get("lead_category") == "HOT":
+    #     logger.info("HOT lead — triggering N8N workflow")
+    #     await trigger_hot_lead_workflow(call_sid, extracted, call_meta)
+
+    logger.debug("Transcript pipeline completed — call_sid=%s", call_sid)
+
+
 @app.get("/health")
 async def health():
     try:
@@ -1041,4 +1360,11 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("call_handler:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "call_handler:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="warning",   # hides "Started server process", access lines, etc.
+        access_log=False,      # hides per-request "GET /api/... 200 OK" spam
+    )

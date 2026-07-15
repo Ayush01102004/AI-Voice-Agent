@@ -12,7 +12,7 @@ import {
 // exists in Supabase but isn't listed here, it won't show up in the panel —
 // keep this in sync with migration_multi_agent.sql.
 const CATEGORIES = [
-  { label: 'Agents',       tables: ['agents', 'agent_config', 'prompt_versions'] },
+  { label: 'Agents',       tables: ['agents', 'agent_numbers', 'agent_config', 'prompt_versions'] },
   { label: 'Leads & Calls', tables: ['calls', 'lead_notes'] },
   { label: 'Forms',        tables: ['forms', 'form_submissions', 'form_send_log'] },
 ]
@@ -23,6 +23,14 @@ const TABLES = {
     readonly: ['created_at', 'updated_at'],
     columns: ['agent_id', 'name', 'phone_number', 'is_active', 'created_at', 'updated_at'],
     types: { is_active: 'boolean' },
+  },
+  agent_numbers: {
+    // Plivo number → agent routing. number is the PK, so one number can
+    // only ever belong to one agent — an agent can still own several rows.
+    pk: 'number',
+    readonly: ['assigned_at'],
+    columns: ['number', 'agent_id', 'region', 'assigned_at'],
+    types: {},
   },
   agent_config: {
     // composite key — one agent can have many keys (system_prompt, etc),

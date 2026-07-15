@@ -7,7 +7,7 @@ import {
 } from 'recharts'
 import {
   Phone, TrendingUp, Flame, Users, RefreshCw, Eye,
-  PhoneCall, Copy, CheckCircle2, AlertCircle, Radio, Search,
+  PhoneCall, Copy, CheckCircle2, CheckCircle, AlertCircle, Radio, Search,
   Clock, Activity, BarChart2, FileText, Download, X, History,
   ClipboardList, Settings, Zap, MessageSquare, Calendar,
   Handshake, StickyNote, ChevronDown, Send, Save, ArrowLeftRight,
@@ -16,6 +16,10 @@ import {
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
 const GOOGLE_FORM_URL = 'https://docs.google.com/forms/d/e/1FAIpQLSdSOD2Wrt-Nfk-6YrzUjIO9HyCRRCFzHz8a5uku43Z4fhhaHA/viewform?usp=dialog'
+// call_handler.py's base URL — holds the Plivo credentials, so the
+// dashboard talks to it for anything Plivo (numbers list, linking a
+// number to an agent) rather than calling Plivo's API directly.
+const CALL_HANDLER_URL = import.meta.env.VITE_CALL_HANDLER_URL || 'http://localhost:8000'
 
 // ── DB adapter ────────────────────────────────────────────────
 function normalizeRow(row) {
@@ -825,10 +829,12 @@ function PageConversations({ records, loading, openTranscript, globalSearch }) {
     </div>
   )
 }
-
 // ══════════════════════════════════════════════════════════════
-// PAGE: FORMS  —  Gmail OAuth Direct Send + Setup Guide
+// PAGE: FORMS  —  Backend Email Send (Resend ) + Setup
 // ══════════════════════════════════════════════════════════════
+const API_BASE = (typeof window !== 'undefined' && window.__API_BASE__)
+  || import.meta.env.VITE_API_BASE
+  || 'http://localhost:8000'
 
 // ── helpers ──────────────────────────────────────────────────
 const inputStyle = {
@@ -839,111 +845,25 @@ const inputStyle = {
 }
 const labelStyle = { fontSize: 11, color: 'var(--text2)', marginBottom: 4, display: 'block' }
 
-// ── Gmail token store (in-memory, persists till refresh) ──────
-let gmailAccessToken = null
-
-// ── Gmail connect hook ────────────────────────────────────────
-function useGmailAuth() {
-  const [connected,  setConnected]  = useState(!!gmailAccessToken)
-  const [userEmail,  setUserEmail]  = useState(localStorage.getItem('gmail_sender') || '')
-
-  function connect() {
-    if (!window.google?.accounts?.oauth2) {
-      alert('Google Identity script not loaded. Add to index.html:\n<script src="https://accounts.google.com/gsi/client" async></script>')
-      return
-    }
-    if (!import.meta.env.VITE_GOOGLE_CLIENT_ID) {
-      alert('VITE_GOOGLE_CLIENT_ID missing in .env file. See Gmail Setup Guide.')
-      return
-    }
-    const client = window.google.accounts.oauth2.initTokenClient({
-      client_id: import.meta.env.VITE_GOOGLE_CLIENT_ID,
-      scope: 'https://www.googleapis.com/auth/gmail.send email profile',
-      callback: async (response) => {
-        if (response.error) return
-        gmailAccessToken = response.access_token
-        const info = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-          headers: { Authorization: `Bearer ${gmailAccessToken}` }
-        }).then(r => r.json())
-        localStorage.setItem('gmail_sender', info.email)
-        setUserEmail(info.email)
-        setConnected(true)
-      }
-    })
-    client.requestAccessToken()
-  }
-
-  function disconnect() {
-    gmailAccessToken = null
-    setConnected(false)
-    setUserEmail('')
-    localStorage.removeItem('gmail_sender')
-  }
-
-  return { connected, userEmail, connect, disconnect }
-}
-
-// ── Send email via Gmail API ──────────────────────────────────
-async function sendViaGmail(to, name, formUrl) {
-  if (!gmailAccessToken) throw new Error('Gmail not connected')
-
-  const subject = 'Quick Form – Help Us Understand Your Requirements'
-  const html = `
-    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px">
-      <h2 style="color:#111">Hi ${name || 'there'},</h2>
-      <p style="color:#555;font-size:15px;line-height:1.6">
-        Please fill out this quick form so we can understand your requirements better.
-      </p>
-      <a href="${formUrl}"
-        style="display:inline-block;margin-top:8px;padding:12px 28px;background:#6366f1;
-               color:#fff;border-radius:8px;text-decoration:none;font-weight:600">
-        Open Form →
-      </a>
-      <p style="color:#aaa;font-size:12px;margin-top:24px">
-        Or copy: <a href="${formUrl}">${formUrl}</a>
-      </p>
-    </div>
-  `
-
-  const message = [
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    `MIME-Version: 1.0`,
-    `Content-Type: text/html; charset=utf-8`,
-    ``,
-    html
-  ].join('\n')
-
-  const encoded = btoa(unescape(encodeURIComponent(message)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-
-  const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+// ── Send email via backend (Resend) — no OAuth, no client ID ──
+async function sendFormEmail(to, name, formUrl) {
+  const res = await fetch(`${API_BASE}/api/send-form-email`, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${gmailAccessToken}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ raw: encoded })
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ lead_email: to, lead_name: name, form_url: formUrl })
   })
-
   if (!res.ok) {
-    const err = await res.json()
-    if (res.status === 401) {
-      gmailAccessToken = null
-      throw new Error('Gmail session expired. Please reconnect.')
-    }
-    throw new Error(err.error?.message || 'Gmail send failed')
+    let detail = 'Send failed'
+    try { detail = (await res.json()).detail || detail } catch {}
+    throw new Error(detail)
   }
-
   return await res.json()
 }
 
 // ── FormSetupModal ────────────────────────────────────────────
-// ── FormSetupModal ────────────────────────────────────────────
 function FormSetupModal({ onClose, onSave, showToast }) {
-  const [gmailHint, setGmailHint] = useState(localStorage.getItem('form_gmail') || '')
   const [formUrl,   setFormUrl]   = useState(localStorage.getItem('google_form_url') || '')
-  const [label,     setLabel]     = useState('')   // FIX 1: was missing, caused silent crash
+  const [label,     setLabel]     = useState('')
   const [saving,    setSaving]    = useState(false)
 
   async function handleSave() {
@@ -953,10 +873,9 @@ function FormSetupModal({ onClose, onSave, showToast }) {
 
     setSaving(true)
     const { error } = await supabase.from('forms').upsert({
-      form_url:    formUrl,
-      label:       label.trim() || `Form ${new Date().toLocaleDateString()}`,  // FIX 1: label now defined
-      gmail:       gmailHint,
-      created_by:  localStorage.getItem('gmail_sender') || '',
+      form_url:     formUrl,
+      label:        label.trim() || `Form ${new Date().toLocaleDateString()}`,
+      created_by:   'dashboard',
       last_used_at: new Date().toISOString()
     }, { onConflict: 'form_url' })
 
@@ -965,7 +884,6 @@ function FormSetupModal({ onClose, onSave, showToast }) {
     if (error) { showToast('Save failed: ' + error.message); return }
 
     localStorage.setItem('google_form_url', formUrl)
-    localStorage.setItem('form_gmail', gmailHint)
     onSave(formUrl)
     showToast('Form saved!')
     onClose()
@@ -982,12 +900,6 @@ function FormSetupModal({ onClose, onSave, showToast }) {
             placeholder="e.g. Onboarding Form, Discovery Call" style={inputStyle} />
         </div>
 
-        <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-          <label style={labelStyle}>Sender Gmail (saved for reference)</label>
-          <input value={gmailHint} onChange={e => setGmailHint(e.target.value)}
-            placeholder="yourname@gmail.com" style={inputStyle} />
-        </div>
-
         <button onClick={() => window.open('https://docs.google.com/forms/create', '_blank')}
           style={{ padding:'9px 14px', borderRadius:8, border:'0.5px solid var(--border2)',
             background:'var(--bg3)', color:'var(--text1)', fontSize:13, cursor:'pointer',
@@ -1002,8 +914,6 @@ function FormSetupModal({ onClose, onSave, showToast }) {
             placeholder="https://docs.google.com/forms/d/e/..." style={inputStyle} />
           <span style={{ fontSize:10, color:'var(--text3)' }}>Google Forms → Share → Copy link → paste here</span>
         </div>
-
-        {/* FIX 2: removed stale localStorage "saved forms" section — library now reads from DB */}
 
         <div style={{ display:'flex', gap:8, justifyContent:'flex-end' }}>
           <button onClick={onClose}
@@ -1079,13 +989,12 @@ function FormLibraryModal({ onClose, onUse, showToast }) {
         ) : (
           <div style={{ overflowY:'auto', display:'flex', flexDirection:'column', gap:10 }}>
             {forms.map(f => (
-              <div key={f.id}   // FIX 3: use f.id not index
+              <div key={f.id}
                 style={{ background:'var(--bg3)', border:'0.5px solid var(--border2)',
                   borderRadius:10, padding:'14px 16px', display:'flex', flexDirection:'column', gap:8 }}>
                 <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
                   <div>
                     <div style={{ fontWeight:600, fontSize:13, color:'var(--text1)' }}>{f.label}</div>
-                    {f.gmail && <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{f.gmail}</div>}
                     {f.created_by && <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>Added by {f.created_by}</div>}
                     <div style={{ fontSize:11, color:'var(--text3)', marginTop:2 }}>{fmtDate(f.created_at)}</div>
                   </div>
@@ -1097,7 +1006,7 @@ function FormLibraryModal({ onClose, onUse, showToast }) {
                       background:'var(--bg2)', color:'var(--text1)', fontSize:12, cursor:'pointer' }}>
                     🔗 Open
                   </button>
-                  <button onClick={() => useForm(f)}   // FIX 3: single call, no double-fire
+                  <button onClick={() => useForm(f)}
                     style={{ padding:'5px 12px', borderRadius:7, border:'none',
                       background:'var(--accent)', color:'#fff', fontSize:12, cursor:'pointer' }}>
                     ✓ Use Form
@@ -1121,8 +1030,9 @@ function FormLibraryModal({ onClose, onUse, showToast }) {
     </div>
   )
 }
-// ── SendFormModal (Gmail OAuth version) ──────────────────────
-function SendFormModal({ onClose, onSent, showToast, formUrl, gmailAuth }) {
+
+// ── SendFormModal ────────────────────────────────────────────
+function SendFormModal({ onClose, onSent, showToast, formUrl }) {
   const [name,      setName]      = useState('')
   const [leadEmail, setLeadEmail] = useState('')
   const [busy,      setBusy]      = useState(false)
@@ -1134,23 +1044,15 @@ function SendFormModal({ onClose, onSent, showToast, formUrl, gmailAuth }) {
     if (!leadEmail.trim())        { showToast('Email is required'); return }
     if (!isValidEmail(leadEmail)) { showToast('Enter a valid email'); return }
     if (!formUrl)                 { showToast('No form URL — click ⚙️ Setup Form'); return }
-    if (!gmailAuth.connected)     { showToast('Connect Gmail first'); return }
 
     setBusy(true)
     try {
-      await sendViaGmail(leadEmail, name, formUrl)
-
-      await supabase.from('form_send_log').insert({
-        lead_name: name, lead_email: leadEmail,
-        sent_by: gmailAuth.userEmail, form_url: formUrl
-      })
-
+      await sendFormEmail(leadEmail, name, formUrl)
       setSent(true)
       showToast(`Email sent to ${leadEmail}`)
       setTimeout(() => { onSent(); onClose() }, 1000)
     } catch (err) {
       showToast(err.message)
-      if (err.message.includes('reconnect')) gmailAuth.connect()
     } finally {
       setBusy(false)
     }
@@ -1160,19 +1062,6 @@ function SendFormModal({ onClose, onSent, showToast, formUrl, gmailAuth }) {
     <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', zIndex:999, display:'flex', alignItems:'center', justifyContent:'center' }}>
       <div style={{ background:'var(--bg2)', border:'0.5px solid var(--border2)', borderRadius:12, padding:28, width:520, display:'flex', flexDirection:'column', gap:18 }}>
         <h3 style={{ margin:0, fontSize:15, color:'var(--text1)' }}>Send Form via Email</h3>
-
-        {/* Gmail status */}
-        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-          padding:'10px 14px', borderRadius:8, background:'var(--bg3)', border:'0.5px solid var(--border2)' }}>
-          <span style={{ fontSize:12, color: gmailAuth.connected ? '#22c55e' : 'var(--text3)' }}>
-            {gmailAuth.connected ? `✓ Sending as ${gmailAuth.userEmail}` : '⚠ Gmail not connected'}
-          </span>
-          <button onClick={gmailAuth.connected ? gmailAuth.disconnect : gmailAuth.connect}
-            style={{ padding:'4px 12px', borderRadius:6, border:'0.5px solid var(--border2)',
-              background:'var(--bg2)', color:'var(--text1)', fontSize:11, cursor:'pointer' }}>
-            {gmailAuth.connected ? 'Disconnect' : 'Connect Gmail'}
-          </button>
-        </div>
 
         {!formUrl && (
           <div style={{ padding:'10px 14px', borderRadius:8, background:'rgba(239,68,68,0.1)',
@@ -1199,11 +1088,11 @@ function SendFormModal({ onClose, onSent, showToast, formUrl, gmailAuth }) {
             Cancel
           </button>
           <button onClick={handleSend}
-            disabled={busy || !leadEmail || !formUrl || !gmailAuth.connected}
+            disabled={busy || !leadEmail || !formUrl}
             style={{ padding:'8px 20px', borderRadius:8, border:'none', fontSize:13,
               background: sent ? '#22c55e' : 'var(--accent)', color:'#fff', cursor:'pointer',
               display:'flex', alignItems:'center', gap:6, minWidth:130, justifyContent:'center',
-              opacity:(busy || !leadEmail || !formUrl || !gmailAuth.connected) ? 0.5 : 1 }}>
+              opacity:(busy || !leadEmail || !formUrl) ? 0.5 : 1 }}>
             {sent ? '✓ Sent!' : busy ? 'Sending…' : '📧 Send Email'}
           </button>
         </div>
@@ -1213,29 +1102,56 @@ function SendFormModal({ onClose, onSent, showToast, formUrl, gmailAuth }) {
 }
 
 // ── SendLogTab ────────────────────────────────────────────────
-function SendLogTab({ showToast, formUrl, gmailAuth }) {
+function SendLogTab({ showToast, formUrl, submissions }) {
   const [log,     setLog]     = useState([])
   const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
+  function loadLog() {
+    setLoading(true)
     supabase.from('form_send_log')
       .select('*')
       .order('sent_at', { ascending: false })
       .limit(200)
       .then(({ data }) => { setLog(data || []); setLoading(false) })
-  }, [])
+  }
+
+  useEffect(() => { loadLog() }, [])
 
   async function handleResend(l) {
-    if (!gmailAuth.connected) { showToast('Connect Gmail first'); return }
     const url = l.form_url || formUrl
     if (!url) { showToast('No form URL available'); return }
     try {
-      await sendViaGmail(l.lead_email, l.lead_name, url)
+      await sendFormEmail(l.lead_email, l.lead_name, url)
       showToast(`Reminder sent to ${l.lead_email}`)
+      loadLog()
     } catch (err) {
       showToast('Resend failed: ' + err.message)
-      if (err.message.includes('reconnect')) gmailAuth.connect()
     }
+  }
+
+  function findResponse(l) {
+    const email = (l.lead_email || '').trim().toLowerCase()
+    if (!email) return null
+    return submissions.find(s => {
+      const subEmail = (s.email || '').trim().toLowerCase()
+      return subEmail && subEmail === email && new Date(s.submitted_at) >= new Date(l.sent_at)
+    }) || null
+  }
+
+  function StatusCell({ l }) {
+    const responded = findResponse(l)
+    if (responded) {
+      return (
+        <span style={{ display:'flex', alignItems:'center', gap:4, color:'#22c55e', fontSize:12 }}
+          title={`Responded ${fmtDate(responded.submitted_at)}`}>
+          <CheckCircle size={13}/> Responded
+        </span>
+      )
+    }
+    if (l.status === 'failed') {
+      return <span style={{ display:'flex', alignItems:'center', gap:4, color:'#ef4444', fontSize:12 }} title={l.error || ''}><AlertCircle size={13}/> Failed</span>
+    }
+    return <span style={{ display:'flex', alignItems:'center', gap:4, color:'var(--text3)', fontSize:12 }}><Clock size={13}/> Pending</span>
   }
 
   return (
@@ -1244,27 +1160,21 @@ function SendLogTab({ showToast, formUrl, gmailAuth }) {
         <table className={styles.table}>
           <thead>
             <tr>
-              <th>Lead Name</th><th>Email</th><th>Sent By</th>
+              <th>Lead Name</th><th>Email</th>
               <th>Sent At</th><th>Status</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={6} className={styles.emptyRow}>Loading…</td></tr>
+              <tr><td colSpan={5} className={styles.emptyRow}>Loading…</td></tr>
             ) : log.length === 0 ? (
-              <tr><td colSpan={6}><VisualEmptyState message="No forms sent yet" /></td></tr>
+              <tr><td colSpan={5}><VisualEmptyState message="No forms sent yet" /></td></tr>
             ) : log.map(l => (
               <tr key={l.id} className={styles.tableRow}>
                 <td style={{ fontWeight:500 }}>{l.lead_name || '—'}</td>
                 <td style={{ fontSize:12, color:'var(--text2)' }}>{l.lead_email}</td>
-                <td style={{ color:'var(--text2)' }}>{l.sent_by || '—'}</td>
                 <td style={{ color:'var(--text2)', whiteSpace:'nowrap' }}>{fmtDate(l.sent_at)}</td>
-                <td>
-                  {l.response_received
-                    ? <span style={{ display:'flex', alignItems:'center', gap:4, color:'#22c55e', fontSize:12 }}><CheckCircle size={13}/> Filled</span>
-                    : <span style={{ display:'flex', alignItems:'center', gap:4, color:'var(--text3)', fontSize:12 }}><Clock size={13}/> Pending</span>
-                  }
-                </td>
+                <td><StatusCell l={l} /></td>
                 <td>
                   <div className={styles.actions}>
                     <button className={styles.iconBtn} title="Resend Email" onClick={() => handleResend(l)}>
@@ -1294,10 +1204,7 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
   const [showModal,      setShowModal]      = useState(false)
   const [showSetup,      setShowSetup]      = useState(false)
   const [showLibrary,    setShowLibrary]    = useState(false)
-  // const [showGuide,      setShowGuide]      = useState(false)
   const [formUrl,        setFormUrl]        = useState(localStorage.getItem('google_form_url') || '')
-
-  const gmailAuth = useGmailAuth()
 
   function loadSubmissions() {
     setLoading(true); setFetchError(null)
@@ -1309,7 +1216,6 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
         if (error) { console.error('[PageForms]', error.message); setFetchError(error.message) }
         const items = data || []
         setSubmissions(items)
-        setFormCount(items.length)
         setLoading(false)
       })
   }
@@ -1330,10 +1236,9 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
 
   return (
     <>
-      {showSetup   && <FormSetupModal      onClose={() => setShowSetup(false)}   onSave={handleUseForm} showToast={showToast} />}
-      {showLibrary && <FormLibraryModal    onClose={() => setShowLibrary(false)} onUse={handleUseForm}  showToast={showToast} />}
-      {/* {showGuide   && <GmailSetupGuideModal onClose={() => setShowGuide(false)} />} */}
-      {showModal   && <SendFormModal       onClose={() => setShowModal(false)}   onSent={() => {}}      showToast={showToast} formUrl={formUrl} gmailAuth={gmailAuth} />}
+      {showSetup   && <FormSetupModal   onClose={() => setShowSetup(false)}   onSave={handleUseForm} showToast={showToast} />}
+      {showLibrary && <FormLibraryModal onClose={() => setShowLibrary(false)} onUse={handleUseForm}  showToast={showToast} />}
+      {showModal   && <SendFormModal    onClose={() => setShowModal(false)}   onSent={() => {}}      showToast={showToast} formUrl={formUrl} />}
 
       {fetchError && (
         <div className={styles.errorBanner} style={{ marginBottom:12 }}>
@@ -1367,23 +1272,6 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
             border: `0.5px solid ${formUrl ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}` }}>
             {formUrl ? '✓ Form set' : '⚠ No form'}
           </span>
-
-          {/* Gmail connect pill */}
-          <button onClick={gmailAuth.connected ? gmailAuth.disconnect : gmailAuth.connect}
-            style={{ padding:'6px 12px', borderRadius:8, fontSize:11, cursor:'pointer',
-              border:'0.5px solid var(--border2)',
-              background: gmailAuth.connected ? 'rgba(34,197,94,0.1)' : 'var(--bg3)',
-              color: gmailAuth.connected ? '#22c55e' : 'var(--text2)',
-              maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {gmailAuth.connected ? `✓ ${gmailAuth.userEmail}` : '🔗 Connect Gmail'}
-          </button>
-
-          {/* Gmail setup guide */}
-          {/* <button onClick={() => setShowGuide(true)}
-            style={{ padding:'6px 12px', borderRadius:8, border:'0.5px solid var(--border2)',
-              background:'var(--bg3)', color:'var(--text2)', fontSize:11, cursor:'pointer' }}>
-            📖 Gmail Guide
-          </button> */}
 
           <button onClick={() => setShowSetup(true)}
             style={{ padding:'6px 14px', borderRadius:8, border:'0.5px solid var(--border2)',
@@ -1454,11 +1342,10 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
                         </button>
                         <button className={styles.iconBtn} title="Send Form Email"
                           onClick={async () => {
-                            if (!gmailAuth.connected) { showToast('Connect Gmail first'); return }
                             if (!formUrl) { showToast('No form URL configured'); return }
                             if (!s.email) { showToast('No email for this lead'); return }
                             try {
-                              await sendViaGmail(s.email, s.name, formUrl)
+                              await sendFormEmail(s.email, s.name, formUrl)
                               showToast(`Form sent to ${s.email}`)
                             } catch (err) {
                               showToast('Send failed: ' + err.message)
@@ -1475,15 +1362,13 @@ function PageForms({ showToast, globalSearch, setFormCount }) {
           </div>
         </div>
       ) : (
-        <SendLogTab showToast={showToast} formUrl={formUrl} gmailAuth={gmailAuth}/>
+        <SendLogTab showToast={showToast} formUrl={formUrl} submissions={submissions}/>
       )}
     </>
   )
 }
 // ══════════════════════════════════════════════════════════════
 // PAGE: ANALYTICS
-// (self-contained — uses only helpers/icons already in this file:
-//  CATEGORY_COLOR, SCORE_COLOR, buildWeeklyData, CheckCircle2, styles.filters)
 // ══════════════════════════════════════════════════════════════
 
 // ── period options + bucketing (local to Analytics page) ──────
@@ -1671,7 +1556,7 @@ function PageAnalytics({ records, stats, loading }) {
   )
 }
 // ══════════════════════════════════════════════════════════════
-// PAGE: PROMPT
+// PAGE: Agent Profiles
 // ══════════════════════════════════════════════════════════════
 function PageAgentProfiles({ showToast }) {
   const [agents, setAgents] = useState([])
@@ -1679,7 +1564,7 @@ function PageAgentProfiles({ showToast }) {
   const [selectedId, setSelectedId] = useState('')
 
   const [name, setName] = useState('')
-  const [phone, setPhone] = useState('')
+  const [phoneNumber, setPhoneNumber] = useState('')
   const [prompt, setPrompt] = useState('')
   const [promptLoading, setPromptLoading] = useState(false)
   const [savingPrompt, setSavingPrompt] = useState(false)
@@ -1688,18 +1573,120 @@ function PageAgentProfiles({ showToast }) {
   const [showCreate, setShowCreate] = useState(false)
   const [newId, setNewId] = useState('')
   const [newName, setNewName] = useState('')
-  const [newPhone, setNewPhone] = useState('')
   const [creating, setCreating] = useState(false)
 
   const [rollback, setRollback] = useState([])
   const [hoveredLogId, setHoveredLogId] = useState(null)
+
+  // Plivo Numbers card — fetches every number rented on the account and
+  // shows which agent (if any) it's linked to via agent_numbers. This is
+  // display/reporting only now (routing is pool-based round-robin in
+  // server.py), but linking still sets agents.phone_number-style caller-ID
+  // association and attaches the shared Plivo Application to the number.
+  const [plivoNumbers, setPlivoNumbers] = useState([])
+  const [plivoLoading, setPlivoLoading] = useState(false)
+  const [plivoError, setPlivoError] = useState('')
+  const [linkingNumber, setLinkingNumber] = useState(null)
+
+  async function loadPlivoNumbers() {
+    setPlivoLoading(true)
+    setPlivoError('')
+    try {
+      const res = await fetch(`${CALL_HANDLER_URL}/api/plivo/numbers`)
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Failed to fetch numbers')
+      setPlivoNumbers(data.numbers || [])
+    } catch (e) {
+      setPlivoError(e.message)
+    }
+    setPlivoLoading(false)
+  }
+
+  useEffect(() => { loadPlivoNumbers() }, [])
+
+  async function linkNumberToSelected(number, region) {
+    if (!selectedId) return
+    setLinkingNumber(number)
+    try {
+      const res = await fetch(`${CALL_HANDLER_URL}/api/plivo/link-number`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: selectedId, number, region }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Link failed')
+      showToast(`${number} → ${name || selectedId} ✓`)
+      await loadPlivoNumbers()
+    } catch (e) {
+      showToast('Link failed: ' + e.message, 'err')
+    }
+    setLinkingNumber(null)
+  }
+
+  async function unlinkNumber(number) {
+    setLinkingNumber(number)
+    try {
+      const res = await fetch(`${CALL_HANDLER_URL}/api/plivo/unlink-number`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ number }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Unlink failed')
+      showToast(`${number} unlinked`)
+      await loadPlivoNumbers()
+    } catch (e) {
+      showToast('Unlink failed: ' + e.message, 'err')
+    }
+    setLinkingNumber(null)
+  }
+
+  // NEW: agent pool — is_active toggle per agent + live "X of Y active"
+  // count. Replaces the per-number-to-agent assignment UI below, since
+  // routing no longer depends on which number an agent owns (any active
+  // agent can take any call, picked via round-robin in server.py).
+  const [togglingActive, setTogglingActive] = useState(false)
+  const [activeCount, setActiveCount] = useState(null)   // { count, total }
+
+  async function loadActiveCount() {
+    try {
+      const res = await fetch(`${CALL_HANDLER_URL}/api/agents/active-count`)
+      const data = await res.json()
+      if (res.ok) setActiveCount(data)
+    } catch (e) {
+      // non-fatal — header strip just stays hidden if call_handler is unreachable
+    }
+  }
+
+  useEffect(() => { loadActiveCount() }, [])
+
+  async function toggleAgentActive(nextValue) {
+    if (!selectedId) return
+    setTogglingActive(true)
+    try {
+      const res = await fetch(`${CALL_HANDLER_URL}/api/agents/${selectedId}/toggle`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: nextValue }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || 'Toggle failed')
+
+      setAgents(prev => prev.map(a => a.agent_id === selectedId ? { ...a, is_active: nextValue } : a))
+      showToast(`${name || selectedId} ${nextValue ? 'activated' : 'deactivated'} ✓`)
+      await loadActiveCount()
+    } catch (e) {
+      showToast('Toggle failed: ' + e.message, 'err')
+    }
+    setTogglingActive(false)
+  }
 
   // ── load all agents ──────────────────────────────────────────
   async function loadAgents(selectAfter) {
     setAgentsLoading(true)
     const { data, error } = await supabase
       .from('agents')
-      .select('agent_id, name, phone_number')
+      .select('agent_id, name, phone_number, is_active')
       .order('created_at', { ascending: true })
 
     if (error) {
@@ -1727,7 +1714,7 @@ function PageAgentProfiles({ showToast }) {
 
     const a = agents.find(x => x.agent_id === selectedId)
     setName(a?.name || '')
-    setPhone(a?.phone_number || '')
+    setPhoneNumber(a?.phone_number || '')
 
     setPromptLoading(true)
     setDirty(false)
@@ -1825,7 +1812,7 @@ function PageAgentProfiles({ showToast }) {
 
     const { error: agentErr } = await supabase
       .from('agents')
-      .insert({ agent_id: id, name: newName.trim(), phone_number: newPhone.trim() || null })
+      .insert({ agent_id: id, name: newName.trim() })
 
     if (agentErr) {
       setCreating(false)
@@ -1841,22 +1828,24 @@ function PageAgentProfiles({ showToast }) {
       setCreating(false)
       showToast('Agent created, but prompt row failed: ' + cfgErr.message, 'err')
     } else {
-      showToast(`Agent "${newName.trim()}" created ✓`)
+      showToast(`Agent "${newName.trim()}" created ✓ — assign a number below`)
     }
 
     setCreating(false)
     setShowCreate(false)
-    setNewId(''); setNewName(''); setNewPhone('')
+    setNewId(''); setNewName('')
     await loadAgents(id)
+    await loadActiveCount()
   }
 
   // ── delete agent ──────────────────────────────────────────────
   async function deleteAgent() {
     if (selectedId === 'default') { showToast('Cannot delete the default agent', 'err'); return }
-    if (!window.confirm(`Delete agent "${name || selectedId}"? This removes its prompt and phone mapping.`)) return
+    if (!window.confirm(`Delete agent "${name || selectedId}"? This removes its prompt and any numbers assigned to it.`)) return
 
     await supabase.from('agent_config').delete().eq('agent_id', selectedId)
     await supabase.from('prompt_versions').delete().eq('agent_id', selectedId)
+    await supabase.from('agent_numbers').delete().eq('agent_id', selectedId)
     const { error } = await supabase.from('agents').delete().eq('agent_id', selectedId)
 
     if (error) {
@@ -1865,8 +1854,9 @@ function PageAgentProfiles({ showToast }) {
     }
 
     showToast('Agent deleted')
-    setSelectedId('')
-    await loadAgents()
+    await loadAgents('default')
+    await loadActiveCount()
+    await loadPlivoNumbers()
   }
 
   const inputStyle = {
@@ -1874,8 +1864,19 @@ function PageAgentProfiles({ showToast }) {
     borderRadius: 7, padding: '8px 10px', color: 'var(--text1)', fontSize: 13, outline: 'none',
   }
 
+  const selectedAgentObj = agents.find(a => a.agent_id === selectedId)
+  const isActive = selectedAgentObj?.is_active ?? true
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+      {/* NEW: agent pool — "X of Y agents active" header strip */}
+      {activeCount && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text2)' }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', background: activeCount.count > 0 ? '#4ade80' : 'var(--hot)' }} />
+          <strong style={{ color: 'var(--text1)' }}>{activeCount.count} of {activeCount.total}</strong> agents active in the call pool
+        </div>
+      )}
 
       {/* PROFILE SELECTOR */}
       <div style={{ background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 12, padding: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -1891,10 +1892,10 @@ function PageAgentProfiles({ showToast }) {
             style={{ ...inputStyle, width: 'auto', minWidth: 220 }}
           >
             {agentsLoading && <option>Loading…</option>}
-            {!agentsLoading && agents.length === 0 && <option>No agents yet</option>}
+            {!agentsLoading && agents.length === 0 && <option>No agents found</option>}
             {agents.map(a => (
               <option key={a.agent_id} value={a.agent_id}>
-                {a.name || a.agent_id}{a.phone_number ? ` — ${a.phone_number}` : ''}
+                {a.is_active === false ? '○ ' : '● '}{a.name || a.agent_id}
               </option>
             ))}
           </select>
@@ -1918,8 +1919,18 @@ function PageAgentProfiles({ showToast }) {
           )}
         </div>
 
+        {/* Defensive: never leave the page silently blank. If agents failed
+            to load or the table is empty, say so explicitly instead of
+            just showing an empty selector with nothing below it. */}
+        {!agentsLoading && agents.length === 0 && (
+          <p style={{ fontSize: 12, color: 'var(--hot)', margin: 0 }}>
+            No agents found in the database. Check that final_schema.sql has been run against this
+            Supabase project, and that this browser can reach it (check .env / VITE_SUPABASE_URL).
+          </p>
+        )}
+
         {selectedId && (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 24, flexWrap: 'wrap' }}>
             <div>
               <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
                 Name
@@ -1929,21 +1940,127 @@ function PageAgentProfiles({ showToast }) {
                 onChange={e => setName(e.target.value)}
                 onBlur={e => saveField('name', e.target.value.trim())}
                 placeholder="e.g. Alex"
-                style={inputStyle}
+                style={{ ...inputStyle, maxWidth: 320 }}
               />
             </div>
+
+            {/* NEW: phone number, saved straight to agents.phone_number
+                (display/caller-ID reference — pool routing in server.py
+                does not depend on this field). */}
+            {/* NEW: phone number, saved straight to agents.phone_number
+                (display/caller-ID reference — pool routing in server.py
+                does not depend on this field). Placeholder shows the
+                number actually linked via agent_numbers (Plivo Numbers
+                card below), if any, so it's visible even when this
+                manual field is empty. */}
             <div>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
-                <Phone size={11} /> Phone Number
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                Phone Number
               </label>
               <input
-                value={phone}
-                onChange={e => setPhone(e.target.value)}
+                value={phoneNumber}
+                onChange={e => setPhoneNumber(e.target.value)}
                 onBlur={e => saveField('phone_number', e.target.value.trim())}
-                placeholder="+14155551234"
-                style={inputStyle}
+                placeholder={
+                  plivoNumbers.find(n => n.assigned_agent_id === selectedId)?.number
+                    ? `Linked: ${plivoNumbers.find(n => n.assigned_agent_id === selectedId).number}`
+                    : 'e.g. +14155550123'
+                }
+                style={{ ...inputStyle, maxWidth: 220 }}
               />
             </div>
+
+            {/* NEW: agent pool — is_active toggle. Any active agent can take
+                any call (round-robin in server.py); this is the on/off
+                switch for whether this agent is currently in that pool.
+                Styled after the existing .filterBtn/.filterActive pill
+                pattern (Dashboard.module.css) since there's no dedicated
+                toggle-switch component in this file yet. */}
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                Call Pool
+              </label>
+              <button
+                onClick={() => toggleAgentActive(!isActive)}
+                disabled={togglingActive}
+                className={isActive ? styles.filterActive : ''}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px',
+                  borderRadius: 20, border: '0.5px solid var(--border)',
+                  background: isActive ? undefined : 'transparent',
+                  color: isActive ? undefined : 'var(--text2)',
+                  fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  opacity: togglingActive ? 0.6 : 1,
+                }}
+              >
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: isActive ? '#4ade80' : 'var(--text3)' }} />
+                {isActive ? 'Active' : 'Inactive'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* PLIVO NUMBERS CARD — own refresh button, independent of the
+          profile selector above. Link/unlink writes agent_numbers and
+          attaches the shared Plivo Application to the number. */}
+      <div style={{ background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 12, padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+            Plivo Numbers
+          </span>
+          <div style={{ flex: 1 }} />
+          <button
+            onClick={loadPlivoNumbers}
+            disabled={plivoLoading}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text1)', fontSize: 12, cursor: 'pointer', opacity: plivoLoading ? 0.6 : 1 }}
+          >
+            <RefreshCw size={13} className={plivoLoading ? styles.spin : ''} /> Refresh
+          </button>
+        </div>
+
+        {plivoError && (
+          <p style={{ fontSize: 12, color: 'var(--hot)', margin: 0 }}>{plivoError}</p>
+        )}
+
+        {!plivoError && plivoLoading && plivoNumbers.length === 0 && (
+          <p style={{ fontSize: 12, color: 'var(--text3)', margin: 0 }}>Loading numbers…</p>
+        )}
+
+        {!plivoLoading && !plivoError && plivoNumbers.length === 0 && (
+          <p style={{ fontSize: 12, color: 'var(--text3)', margin: 0 }}>No numbers found on this Plivo account.</p>
+        )}
+
+        {plivoNumbers.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {plivoNumbers.map(n => (
+              <div key={n.number} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '8px 10px', background: 'var(--bg3)', borderRadius: 8, fontSize: 13 }}>
+                <span style={{ fontFamily: 'monospace', color: 'var(--text1)', minWidth: 140 }}>{n.number}</span>
+                <span style={{ fontSize: 11, color: 'var(--text3)' }}>{n.region || '—'}</span>
+                <div style={{ flex: 1 }} />
+                <span style={{ fontSize: 11, color: n.assigned_agent_name ? 'var(--accent)' : 'var(--text3)' }}>
+                  {n.assigned_agent_name ? `→ ${n.assigned_agent_name}` : 'Unassigned'}
+                </span>
+                {selectedId && n.assigned_agent_id !== selectedId && (
+                  <button
+                    onClick={() => linkNumberToSelected(n.number, n.region)}
+                    disabled={linkingNumber === n.number}
+                    style={{ padding: '5px 10px', background: 'var(--accent)', border: 'none', borderRadius: 6, color: '#fff', fontSize: 11, fontWeight: 600, cursor: 'pointer', opacity: linkingNumber === n.number ? 0.6 : 1 }}
+                  >
+                    {linkingNumber === n.number ? '…' : `Assign to ${name || selectedId}`}
+                  </button>
+                )}
+                {n.assigned_agent_id === selectedId && (
+                  <button
+                    onClick={() => unlinkNumber(n.number)}
+                    disabled={linkingNumber === n.number}
+                    style={{ padding: '5px 10px', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 6, color: 'var(--hot)', fontSize: 11, cursor: 'pointer', opacity: linkingNumber === n.number ? 0.6 : 1 }}
+                  >
+                    Unlink
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -1951,10 +2068,9 @@ function PageAgentProfiles({ showToast }) {
       {/* CREATE FORM */}
       {showCreate && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10, background: 'var(--bg2)', border: '0.5px solid var(--accent)', borderRadius: 12, padding: 14 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
             <input value={newId} onChange={e => setNewId(e.target.value)} placeholder="agent_id (e.g. alex)" style={inputStyle} />
             <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Display name" style={inputStyle} />
-            <input value={newPhone} onChange={e => setNewPhone(e.target.value)} placeholder="Phone +1..." style={inputStyle} />
           </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <button onClick={() => setShowCreate(false)} style={{ padding: '7px 12px', background: 'transparent', border: 'none', color: 'var(--text2)', fontSize: 12, cursor: 'pointer' }}>
