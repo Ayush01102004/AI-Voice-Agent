@@ -66,8 +66,8 @@ Phone numbers are normalized to E.164 via `toE164()` with a configurable default
 
 ## Dashboard pages
 
-| Page             | File                    |           Purpose                                                                                    |
-|--                |                         |                                                                                                      |
+| Page             | File                    | Purpose                                                                                              |
+|------------------|-------------------------|------------------------------------------------------------------------------------------------------|
 | Dashboard        | `PageDashboard.jsx`     | Metrics, calls-over-time, lead breakdown, sources, recent leads table + CSV export                   |
 | Leads            | `PageLeads.jsx`         | Full lead table/actions                                                                              |
 | Conversations    | `PageConversations.jsx` | Paginated call list + transcript viewer                                                              |
