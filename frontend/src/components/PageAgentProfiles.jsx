@@ -1,24 +1,25 @@
-// ══════════════════════════════════════════════════════════════
-// PAGE: Agent Profiles
-// ══════════════════════════════════════════════════════════════
-//
-// NEW — batch calling state/logic now lives in batchCallStore.js
-// (module-level, survives page navigation). This file only renders
-// against that store. Adjust the import path to wherever you place
-// batchCallStore.js relative to this file.
+// src/components/PageAgentProfiles.jsx
+import { useEffect, useState, useRef } from 'react'
+import { PhoneCall, Plus, Trash2, Save, Play, Pause, Square, ArrowRight, Download, RefreshCw } from 'lucide-react'
+import { supabase } from '../supabaseClient'
+import styles from './Dashboard.module.css'
+import { CALL_HANDLER_URL } from './dashboardShared'
+
+// Batch calling state/loop lives in ./batchCallStore (module-level,
+// survives page navigation). This component only renders `batch`
+// (a read-only snapshot) and calls the store's exported functions.
 import {
-  useBatchStore, COUNTRY_CODES, toE164, BATCH_STATUSES,
-  setCountryCode as setBatchCountryCodeStore, setAgentId as setBatchAgentIdStore,
+  useBatchStore, COUNTRY_CODES, BATCH_STATUSES, toE164,
+  setCountryCode as setBatchCountryCode, setAgentId as setBatchAgentId,
   loadFromFileInput, loadFromFilePicker, loadFromGoogleSheetCsvUrl,
   startBatch, pauseBatch, stopBatch, exportBatchSheet,
 } from './batchCallStore'
 
-// NEW: base URL for the voice server (server.py) — separate from
-// CALL_HANDLER_URL (call_handler.py). Set this in your env/config,
-// e.g. const VOICE_SERVER_URL = import.meta.env.VITE_VOICE_SERVER_URL
+// base URL for the voice server (server.py) — separate from
+// CALL_HANDLER_URL (call_handler.py).
 const VOICE_SERVER_URL = import.meta.env.VITE_VOICE_SERVER_URL || 'http://localhost:8080'
 
-function PageAgentProfiles({ showToast }) {
+export default function PageAgentProfiles({ showToast }) {
   const [agents, setAgents] = useState([])
   const [agentsLoading, setAgentsLoading] = useState(true)
   const [selectedId, setSelectedId] = useState('')
@@ -305,12 +306,12 @@ function PageAgentProfiles({ showToast }) {
   }
 
   // ────────────────────────────────────────────────────────────
-  // NEW: dashboard voice-server client — outbound call trigger.
-  // Hits server.py's POST /api/outbound-call directly (to, agent_id).
-  // Tracks only the current dial attempt's status, not a growing log.
+  // Single-call dialer — hits server.py's POST /api/outbound-call
+  // directly (to, agent_id, name).
   // ────────────────────────────────────────────────────────────
-  const [dialCountryCode, setDialCountryCode] = useState('91') // NEW
+  const [dialCountryCode, setDialCountryCode] = useState('91')
   const [dialTo, setDialTo] = useState('')
+  const [dialName, setDialName] = useState('') // customer name → LLM lead_name for this call
   const [dialAgentId, setDialAgentId] = useState('')
   const [dialing, setDialing] = useState(false)
   const [callStatus, setCallStatus] = useState(null) // { status, message, time }
@@ -320,30 +321,37 @@ function PageAgentProfiles({ showToast }) {
   }, [agents, dialAgentId])
 
   async function placeCall() {
-    const to = toE164(dialTo, dialCountryCode) // NEW — prefix applied here
+    const to = toE164(dialTo, dialCountryCode)
     if (!dialTo.trim()) { showToast('Enter a phone number to call', 'err'); return }
     if (!dialAgentId) { showToast('Select an agent', 'err'); return }
 
     const agentLabel = agents.find(a => a.agent_id === dialAgentId)?.name || dialAgentId
 
     setDialing(true)
-    setCallStatus({ status: 'dialing', message: `Dialing ${to} via ${agentLabel}…`, time: new Date() })
+    setCallStatus({ status: 'dialing', message: `Dialing ${to} via ${agentLabel}${dialName.trim() ? ` (${dialName.trim()})` : ''}…`, time: new Date() })
 
     try {
       const res = await fetch(`${VOICE_SERVER_URL}/api/outbound-call`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to, agent_id: dialAgentId }),
+        body: JSON.stringify({ to, agent_id: dialAgentId, name: dialName.trim() }),
       })
       const data = await res.json()
 
       if (!res.ok || data.error) {
         setCallStatus({ status: 'failed', message: data.error || 'Call failed', time: new Date() })
         showToast('Call failed: ' + (data.error || res.statusText), 'err')
+      } else if (!data.call_uuid) {
+        setCallStatus({
+          status: 'failed',
+          message: `No answer webhook received from Plivo — call likely never connected (invalid number / carrier reject). from=${data.from || '—'}`,
+          time: new Date(),
+        })
+        showToast('Call did not connect', 'err')
       } else {
         setCallStatus({
           status: 'placed',
-          message: `Call placed ✓ from=${data.from || '—'} call_uuid=${data.call_uuid || '—'}`,
+          message: `Call placed ✓ from=${data.from || '—'} call_uuid=${data.call_uuid}`,
           time: new Date(),
         })
         showToast(`Call to ${to} placed ✓`)
@@ -364,82 +372,97 @@ function PageAgentProfiles({ showToast }) {
   }
 
   // ────────────────────────────────────────────────────────────
-  // NEW: BATCH CALLING — everything reads from batchCallStore.js.
-  // No local state, no local loop — this component just renders
-  // the current store snapshot and calls the store's functions.
+  // BATCH CALLING — all state + the dialing loop live in
+  // batchCallStore.js. This component only renders `batch`.
   // ────────────────────────────────────────────────────────────
   const batch = useBatchStore()
-  const [sheetLinkInput, setSheetLinkInput] = useState('')
-  const [sheetLinkLoading, setSheetLinkLoading] = useState(false)
-  const fileInputRef = useRef(null)
+  const batchTableBodyRef = useRef(null)
+  const activeRowRef = useRef(null)
 
   useEffect(() => {
-    if (!batch.agentId && agents.length) setBatchAgentIdStore(agents[0].agent_id)
+    if (batch.index >= 0 && activeRowRef.current) {
+      activeRowRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    }
+  }, [batch.index])
+
+  useEffect(() => {
+    if (!batch.agentId && agents.length) setBatchAgentId(agents[0].agent_id)
   }, [agents, batch.agentId])
 
-  async function handleBatchFileInput(e) {
+  async function handleBatchFile(e) {
     const file = e.target.files?.[0]
     if (!file) return
     try {
       await loadFromFileInput(file)
-      showToast(`Loaded ${file.name} (no live write-back on this upload path — export manually when done)`)
+      showToast(`Loaded ✓ — no live disk write from this picker (use "Load with live write" for that)`)
     } catch (err) {
       showToast('Failed to parse file: ' + err.message, 'err')
     }
+    e.target.value = '' // allow re-selecting the same file
   }
 
-  async function handleBatchFilePicker() {
+  // Chrome/Edge only — opens the SAME file for read+write, so every
+  // status update writes straight back into the source file on disk.
+  async function handleBatchFileLiveWrite() {
     try {
       await loadFromFilePicker()
-      showToast('Loaded — status will write back to this file after every call ✓')
+      showToast('Loaded ✓ — live-writing status back to the source file')
     } catch (err) {
       showToast(err.message, 'err')
     }
   }
 
-  async function handleSheetLink() {
-    if (!sheetLinkInput.trim()) return
-    setSheetLinkLoading(true)
+  const [sheetsUrl, setSheetsUrl] = useState('')
+  const [sheetsLoading, setSheetsLoading] = useState(false)
+
+  async function importFromGoogleSheets() {
+    if (!sheetsUrl.trim()) { showToast('Paste a Google Sheets link first', 'err'); return }
+    if (batch.running) { showToast('Stop the current batch first', 'err'); return }
+    setSheetsLoading(true)
     try {
-      await loadFromGoogleSheetCsvUrl(sheetLinkInput.trim())
-      showToast('Sheet loaded (read-only — export locally to save status, no write-back to Google Sheets)')
-    } catch (err) {
-      showToast(err.message, 'err')
+      await loadFromGoogleSheetCsvUrl(sheetsUrl.trim())
+      showToast('Sheet imported ✓')
+    } catch (e) {
+      showToast('Google Sheets import failed: ' + e.message, 'err')
     }
-    setSheetLinkLoading(false)
+    setSheetsLoading(false)
   }
 
-  function handleStartBatch() {
+  function handleStartOrResume() {
     if (!batch.rows.length) { showToast('Upload a sheet first', 'err'); return }
     if (!batch.agentId) { showToast('Select an agent', 'err'); return }
+    const resuming = batch.index >= 0
     startBatch(VOICE_SERVER_URL, CALL_HANDLER_URL)
-    showToast(batch.index >= 0 ? 'Resuming batch…' : 'Batch calling started')
+    showToast(resuming ? 'Batch resumed' : 'Batch calling started')
   }
 
-  function handlePauseBatch() {
+  function handlePause() {
     pauseBatch()
     showToast('Batch paused')
   }
 
-  function handleStopBatch() {
+  function handleStop() {
     stopBatch()
-    showToast('Stopping — letting the current call finish first…')
+    showToast('Batch stopped')
   }
 
-  function handleExportBatch() {
+  function handleExport() {
     if (!batch.rows.length) { showToast('Nothing to export', 'err'); return }
     exportBatchSheet()
     showToast('Sheet exported ✓')
   }
 
+  // Colors for the real Plivo-CDR-derived statuses (batchCallStore.js
+  // BATCH_STATUSES — no more DIALING/RINGING, a row is PENDING or
+  // terminal, nothing in between).
   const batchStatusColor = {
-    [BATCH_STATUSES.PENDING]:   'var(--text3)',
-    [BATCH_STATUSES.CONNECTED]: '#4ade80',
-    [BATCH_STATUSES.NO_ANSWER]: 'var(--warm, #f5a623)',
-    [BATCH_STATUSES.BUSY]:      'var(--warm, #f5a623)',
-    [BATCH_STATUSES.REJECTED]:  'var(--hot)',
-    [BATCH_STATUSES.FAILED]:    'var(--hot)',
-    [BATCH_STATUSES.UNKNOWN]:   'var(--text3)',
+    PENDING:   'var(--text3)',
+    CONNECTED: '#4ade80',
+    NO_ANSWER: 'var(--warm, #f5a623)',
+    BUSY:      'var(--warm, #f5a623)',
+    REJECTED:  'var(--hot)',
+    FAILED:    'var(--hot)',
+    UNKNOWN:   'var(--warm, #f5a623)',
   }
 
   const inputStyle = {
@@ -488,6 +511,18 @@ function PageAgentProfiles({ showToast }) {
             />
           </div>
 
+          <div style={{ flex: '1 1 200px' }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+              Customer Name <span style={{ color: 'var(--text3)', textTransform: 'none', fontWeight: 400 }}>(optional)</span>
+            </label>
+            <input
+              value={dialName}
+              onChange={e => setDialName(e.target.value)}
+              placeholder="e.g. Priya Sharma"
+              style={inputStyle}
+            />
+          </div>
+
           <div style={{ flex: '1 1 220px' }}>
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
               Agent
@@ -525,10 +560,10 @@ function PageAgentProfiles({ showToast }) {
         {dialTo.trim() && (
           <p style={{ fontSize: 11, color: 'var(--text3)', margin: 0 }}>
             Will dial as: <span style={{ fontFamily: 'monospace', color: 'var(--text2)' }}>{toE164(dialTo, dialCountryCode)}</span>
+            {dialName.trim() && <> — greeting will use <span style={{ color: 'var(--text2)' }}>"{dialName.trim()}"</span></>}
           </p>
         )}
 
-        {/* CURRENT CALL STATUS — clears itself after the call is placed */}
         {callStatus && (
           <div style={{ borderTop: '0.5px solid var(--border)', paddingTop: 10, display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
             <span style={{ width: 7, height: 7, borderRadius: '50%', background: statusColor[callStatus.status] || 'var(--text3)', flexShrink: 0 }} />
@@ -538,19 +573,15 @@ function PageAgentProfiles({ showToast }) {
         )}
       </div>
 
-      {/* NEW: BATCH CALLING CARD — reads/writes batchCallStore.js */}
+      {/* BATCH CALLING CARD */}
       <div style={{ background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 12, padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
             Batch Calling
           </span>
-          {batch.rows.length > 0 && (
-            <span style={{
-              fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 10,
-              background: batch.canLiveWrite ? 'rgba(74,222,128,0.15)' : 'rgba(245,166,35,0.15)',
-              color: batch.canLiveWrite ? '#4ade80' : 'var(--warm, #f5a623)',
-            }}>
-              {batch.canLiveWrite ? 'Live write ✓' : 'Manual export only'}
+          {batch.canLiveWrite && (
+            <span style={{ fontSize: 10, color: '#4ade80', display: 'flex', alignItems: 'center', gap: 4 }}>
+              ● live-writing to disk
             </span>
           )}
         </div>
@@ -560,7 +591,7 @@ function PageAgentProfiles({ showToast }) {
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
               Country
             </label>
-            <select value={batch.countryCode} onChange={e => setBatchCountryCodeStore(e.target.value)} style={inputStyle} disabled={batch.running}>
+            <select value={batch.countryCode} onChange={e => setBatchCountryCode(e.target.value)} style={inputStyle} disabled={batch.running}>
               {COUNTRY_CODES.map(c => <option key={c.code} value={c.code}>{c.label}</option>)}
             </select>
           </div>
@@ -569,67 +600,76 @@ function PageAgentProfiles({ showToast }) {
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
               Agent
             </label>
-            <select value={batch.agentId} onChange={e => setBatchAgentIdStore(e.target.value)} style={inputStyle} disabled={batch.running || agentsLoading}>
+            <select value={batch.agentId} onChange={e => setBatchAgentId(e.target.value)} style={inputStyle} disabled={batch.running || agentsLoading}>
               {agentsLoading && <option>Loading…</option>}
               {agents.map(a => (
                 <option key={a.agent_id} value={a.agent_id}>{a.name || '—'} ({a.agent_id})</option>
               ))}
             </select>
           </div>
-        </div>
 
-        {/* NEW — two ways in: pick a file with live write-back (Chrome/Edge), or plain
-            upload (works everywhere, export manually when done) */}
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <div style={{ flex: '1 1 220px' }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+              Sheet (.xlsx / .csv)
+            </label>
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={handleBatchFile}
+              disabled={batch.running}
+              style={{ ...inputStyle, padding: '6px' }}
+            />
+          </div>
+
           <button
-            onClick={handleBatchFilePicker}
+            onClick={handleBatchFileLiveWrite}
             disabled={batch.running}
-            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 8, color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', opacity: batch.running ? 0.6 : 1 }}
+            title="Chrome/Edge only — writes call status back into this same file as the batch runs"
+            style={{ padding: '8px 12px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text2)', fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap', opacity: batch.running ? 0.5 : 1 }}
           >
-            <Upload size={13} /> Choose Sheet (live-write)
+            Load with live write
           </button>
-          <span style={{ fontSize: 11, color: 'var(--text3)' }}>or</span>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".xlsx,.xls,.csv"
-            onChange={handleBatchFileInput}
-            disabled={batch.running}
-            style={{ ...inputStyle, padding: '6px', width: 220 }}
-          />
         </div>
 
-        {/* NEW — Google Sheet import (read-only, needs Publish to web CSV link) */}
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <input
-            value={sheetLinkInput}
-            onChange={e => setSheetLinkInput(e.target.value)}
-            placeholder="Google Sheet 'Publish to web → CSV' link (read-only import)"
-            style={{ ...inputStyle, flex: '1 1 320px' }}
-            disabled={batch.running}
-          />
+        {/* Google Sheets import — accepts a normal Share link or a
+            published-to-web CSV link (see batchCallStore.js normalizeSheetsCsvUrl) */}
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+          <div style={{ flex: '1 1 320px' }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+              …or Google Sheets link (shared or published-to-web)
+            </label>
+            <input
+              value={sheetsUrl}
+              onChange={e => setSheetsUrl(e.target.value)}
+              placeholder="https://docs.google.com/spreadsheets/d/…"
+              disabled={batch.running || sheetsLoading}
+              style={inputStyle}
+            />
+          </div>
           <button
-            onClick={handleSheetLink}
-            disabled={batch.running || sheetLinkLoading || !sheetLinkInput.trim()}
-            style={{ padding: '7px 14px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text1)', fontSize: 12, fontWeight: 600, cursor: 'pointer', opacity: (!sheetLinkInput.trim() || sheetLinkLoading) ? 0.6 : 1 }}
+            onClick={importFromGoogleSheets}
+            disabled={batch.running || sheetsLoading || !sheetsUrl.trim()}
+            style={{ padding: '8px 14px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text1)', fontSize: 12, fontWeight: 600, cursor: 'pointer', opacity: (!sheetsUrl.trim() || sheetsLoading) ? 0.6 : 1, whiteSpace: 'nowrap' }}
           >
-            {sheetLinkLoading ? 'Loading…' : 'Load Sheet'}
+            {sheetsLoading ? 'Loading…' : 'Import'}
           </button>
         </div>
         <p style={{ fontSize: 10, color: 'var(--text3)', margin: 0 }}>
-          Google Sheets import is read-only — status won't write back to the live sheet (needs Sheets API + OAuth, a backend addition). Export locally instead once the run is done.
+          Read-only import — this pulls a snapshot of the sheet. Status updates write to the local table / disk / export, not back to the original Google Sheet.
+          Add a "Name" column to have each row's lead name passed to the LLM automatically.
         </p>
 
         {batch.rows.length > 0 && (
           <p style={{ fontSize: 11, color: 'var(--text3)', margin: 0 }}>
-            {batch.fileName} — {batch.rows.length} rows — phone column detected: <span style={{ color: 'var(--text2)', fontFamily: 'monospace' }}>{batch.phoneKey}</span>
+            {batch.fileName} — {batch.rows.length} rows — phone column: <span style={{ color: 'var(--text2)', fontFamily: 'monospace' }}>{batch.phoneKey}</span>
+            {batch.nameKey && <> — name column: <span style={{ color: 'var(--text2)', fontFamily: 'monospace' }}>{batch.nameKey}</span></>}
           </p>
         )}
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           {!batch.running ? (
             <button
-              onClick={handleStartBatch}
+              onClick={handleStartOrResume}
               disabled={!batch.rows.length || !batch.agentId}
               style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'var(--accent)', border: 'none', borderRadius: 8, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.rows.length || !batch.agentId) ? 0.6 : 1 }}
             >
@@ -637,21 +677,21 @@ function PageAgentProfiles({ showToast }) {
             </button>
           ) : (
             <button
-              onClick={handlePauseBatch}
+              onClick={handlePause}
               style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text1)', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
             >
               <Pause size={14} /> Pause
             </button>
           )}
           <button
-            onClick={handleStopBatch}
+            onClick={handleStop}
             disabled={!batch.running && batch.index < 0}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--hot)', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.running && batch.index < 0) ? 0.5 : 1 }}
           >
             <Square size={14} /> Stop
           </button>
           <button
-            onClick={handleExportBatch}
+            onClick={handleExport}
             disabled={!batch.rows.length}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--text1)', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: !batch.rows.length ? 0.5 : 1, marginLeft: 'auto' }}
           >
@@ -659,30 +699,37 @@ function PageAgentProfiles({ showToast }) {
           </button>
         </div>
 
-        {/* ROWS TABLE — current row pointer + per-row status
-            FIXED SCROLLBAR: in a flex-column parent, a child div's default
-            min-height is "auto", which lets it grow to fit content and
-            overrides maxHeight — the box never scrolls, the whole page does
-            instead. minHeight: 0 removes that override. */}
+        {/* ROWS TABLE — current row pointer + per-row status */}
         {batch.rows.length > 0 && (
-          <div style={{ maxHeight: 320, minHeight: 0, overflowY: 'auto', border: '0.5px solid var(--border)', borderRadius: 8 }}>
+          <div ref={batchTableBodyRef} style={{ maxHeight: 280, overflowY: 'auto', border: '0.5px solid var(--border)', borderRadius: 8 }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-              <thead style={{ position: 'sticky', top: 0, background: 'var(--bg3)' }}>
+              <thead style={{ position: 'sticky', top: 0, background: 'var(--bg3)', zIndex: 1 }}>
                 <tr>
                   <th style={{ padding: '6px 8px', textAlign: 'left', width: 24 }}></th>
                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>#</th>
                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Phone</th>
+                  {batch.nameKey && <th style={{ padding: '6px 8px', textAlign: 'left' }}>Name</th>}
                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Status</th>
                 </tr>
               </thead>
               <tbody>
                 {batch.rows.map((r, i) => (
-                  <tr key={i} style={{ background: i === batch.index ? 'var(--bg3)' : 'transparent' }}>
-                    <td style={{ padding: '6px 8px' }}>{i === batch.index && <ArrowRight size={13} color="var(--accent)" />}</td>
+                  <tr
+                    key={i}
+                    ref={i === batch.index ? activeRowRef : null}
+                    style={{ background: i === batch.index ? 'var(--bg3)' : 'transparent' }}
+                  >
+                    <td style={{ padding: '6px 8px' }}>{i === batch.index && batch.running && <ArrowRight size={13} color="var(--accent)" />}</td>
                     <td style={{ padding: '6px 8px', color: 'var(--text3)' }}>{r.__row}</td>
                     <td style={{ padding: '6px 8px', fontFamily: 'monospace', color: 'var(--text1)' }}>{toE164(r.__phone, batch.countryCode)}</td>
+                    {batch.nameKey && <td style={{ padding: '6px 8px', color: 'var(--text2)' }}>{r[batch.nameKey] || '—'}</td>}
                     <td style={{ padding: '6px 8px' }}>
-                      <span style={{ color: batchStatusColor[r.__status] || 'var(--text3)', fontWeight: 600 }}>{r.__status}</span>
+                      <span style={{ color: batchStatusColor[r.__status] || 'var(--text3)', fontWeight: 600 }}>
+                        {BATCH_STATUSES[r.__status] || r.__status}
+                      </span>
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <span style={{ color: batchStatusColor[r.__status] || 'var(--text3)', fontWeight: 600 }}>{r.__hangupCause}</span>
                       {r.__hangupCause && (
                         <span style={{ color: 'var(--text3)', marginLeft: 6, fontWeight: 400 }}>({r.__hangupCause})</span>
                       )}
@@ -694,13 +741,12 @@ function PageAgentProfiles({ showToast }) {
           </div>
         )}
 
-        {/* NEW — single current-row log line, not a growing list */}
+        {/* CURRENT-ROW LOG — single line, not a growing list */}
         {batch.currentLog && (
-          <div style={{ display: 'flex', gap: 8, fontSize: 12, padding: '8px 10px', background: 'var(--bg3)', borderRadius: 8, alignItems: 'center' }}>
-            <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, background: batch.currentLog.level === 'err' ? 'var(--hot)' : batch.currentLog.level === 'ok' ? '#4ade80' : 'var(--accent)' }} />
+          <div style={{ display: 'flex', gap: 8, fontSize: 11, padding: '6px 8px', background: 'var(--bg3)', borderRadius: 6, alignItems: 'center' }}>
             <span style={{ color: 'var(--text3)', flexShrink: 0 }}>{batch.currentLog.time.toLocaleTimeString()}</span>
             <span style={{ color: 'var(--text3)', flexShrink: 0 }}>row {batch.currentLog.row}</span>
-            <span style={{ color: 'var(--text1)' }}>{batch.currentLog.message}</span>
+            <span style={{ color: batch.currentLog.level === 'err' ? 'var(--hot)' : batch.currentLog.level === 'ok' ? '#4ade80' : 'var(--text1)' }}>{batch.currentLog.message}</span>
           </div>
         )}
       </div>
