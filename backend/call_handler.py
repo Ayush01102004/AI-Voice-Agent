@@ -33,6 +33,11 @@ Upgrades vs v3.6.0 — Forms email, no OAuth:
                                                        Gmail OAuth — zero setup for end users,
                                                        single admin-side API key, real delivery
                                                        status logged to form_send_log]
+
+Upgrades vs v3.7.0 — Recording playback:
+  23. GET /api/recording/{call_sid}                  [streams the already-stored recording_url
+                                                       (saved on /plivo/recording, upgrade #19)
+                                                       through Plivo auth — no Plivo API re-query]
 """
 
 import asyncio
@@ -51,7 +56,7 @@ import resend
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from groq import AsyncGroq
 from supabase import create_client, Client
 
@@ -220,7 +225,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Inbox Infotech — Call Handler",
-    version="3.4.0",
+    version="3.7.0",
     lifespan=lifespan,
 )
 
@@ -780,6 +785,66 @@ async def get_transcript(call_sid: str):
     return JSONResponse({"call_sid": call_sid, "transcript": parsed})
 
 
+# ═══════════════════════════════════════════════════════════════
+# NEW — UPGRADE #23: /api/recording/{call_sid}
+# Streams the recording_url already saved on the calls row (written by
+# /plivo/recording, upgrade #19) through Plivo auth. No Plivo API
+# re-query — the URL is already ours, this just proxies bytes so the
+# browser doesn't need Plivo basic-auth creds client-side.
+# ═══════════════════════════════════════════════════════════════
+
+def _load_recording_url_sync(call_sid: str) -> Optional[str]:
+    row = (
+        _get_supabase()
+        .table("calls")
+        .select("recording_url")
+        .eq("call_sid", call_sid)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    return (row or {}).get("recording_url") or None
+
+
+@app.get("/api/recording/{call_sid}")
+async def stream_recording(call_sid: str):
+    try:
+        url = await asyncio.to_thread(_with_retry, _load_recording_url_sync, call_sid)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not url:
+        raise HTTPException(status_code=404, detail=f"No recording for {call_sid}")
+
+    client = httpx.AsyncClient(timeout=60)
+    try:
+        req = client.build_request("GET", url, auth=(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN))
+        upstream = await client.send(req, stream=True)
+    except Exception as e:
+        await client.aclose()
+        logger.error("Recording proxy connect failed — call_sid=%s: %s", call_sid, e)
+        raise HTTPException(status_code=502, detail="Failed to reach recording storage")
+
+    if upstream.status_code != 200:
+        await upstream.aclose()
+        await client.aclose()
+        logger.warning("Recording proxy upstream %d — call_sid=%s", upstream.status_code, call_sid)
+        raise HTTPException(status_code=502, detail=f"Upstream returned {upstream.status_code}")
+
+    async def _body():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        _body(),
+        media_type=upstream.headers.get("content-type", "audio/mpeg"),
+        headers={"Content-Disposition": f'inline; filename="{call_sid}.mp3"'},
+    )
+
 
 def _fetch_agent_profile_sync(agent_id: str) -> Dict[str, Optional[str]]:
     """Name + phone live only on the `agents` table now — this is the single
@@ -1150,6 +1215,68 @@ async def unlink_plivo_number(request: Request):
     return JSONResponse({"status": "ok", "number": number})
 
 
+# NEW — real-time Plivo call status, straight from Plivo's own record for
+# this call_uuid (their `calls.get`), not our derived LLM outcome.
+#
+# WHY THIS ENDPOINT EXISTS: calls.live_outcome only gets written once the
+# LLM conversation actually starts and finishes (see CallOutcome enum in
+# server.py) — but Plivo's own ringing/busy/no-answer/failed states happen
+# BEFORE that, and for an unanswered call, no WS session ever starts, so
+# live_outcome is NEVER written at all. Polling only live_outcome makes an
+# unanswered test call sit at "Unresolved" forever, even though Plivo knows
+# it rang out — this endpoint lets the dashboard ask Plivo directly.
+#
+# Plivo's call_status values: "queued", "ringing", "in-progress",
+# "completed", "busy", "failed", "no-answer", "canceled", "timeout",
+# "rejected". end_time / hangup_cause are populated once terminal.
+@app.get("/api/plivo/call-status")
+async def plivo_call_status(call_uuid: str):
+    call_uuid = (call_uuid or "").strip()
+    if not call_uuid:
+        raise HTTPException(status_code=400, detail="call_uuid is required")
+
+    def _get():
+        return plivo_client.calls.get(call_uuid)
+
+    try:
+        # BUG FIX — plivo_client has no timeout set (Plivo SDK sits on
+        # `requests`, which has NO default timeout). If Plivo's API ever
+        # stalls answering this call (seen right after a REST-initiated
+        # hangup, while the CDR is still being written), the thread this
+        # runs in blocks forever, this endpoint never responds, the
+        # dashboard's fetch() never resolves, and the whole batch loop
+        # freezes on that one row — no pointer movement, no next call,
+        # exactly the "stuck after agent hangup" symptom. wait_for() caps
+        # it so this endpoint always answers within 12s even if the
+        # underlying thread is still stuck (it leaks that one thread, but
+        # never blocks the request/response cycle again).
+        call = await asyncio.wait_for(asyncio.to_thread(_with_retry, _get), timeout=12)
+    except asyncio.TimeoutError:
+        return JSONResponse({"status": "timeout", "call_uuid": call_uuid, "detail": "Plivo API did not respond in time — treat as not-yet-resolved, keep polling"})
+    except Exception as e:
+        # Plivo 404s a call_uuid it doesn't recognize (e.g. before the
+        # call record has propagated) — treat as "not found yet", not
+        # a hard error, so the dashboard can just keep polling.
+        return JSONResponse({"status": "not_found", "call_uuid": call_uuid, "detail": str(e)})
+
+    call_status  = getattr(call, "call_status", None) or (call.get("call_status") if isinstance(call, dict) else None)
+    end_time     = getattr(call, "end_time", None)    or (call.get("end_time")    if isinstance(call, dict) else None)
+    hangup_cause = (
+    getattr(call, "hangup_cause_name", None)
+    or getattr(call, "hangup_cause", None)
+    or (call.get("hangup_cause_name") if isinstance(call, dict) else None)
+    or (call.get("hangup_cause") if isinstance(call, dict) else None)
+)
+
+    return JSONResponse({
+        "status":       "ok",
+        "call_uuid":    call_uuid,
+        "call_status":  call_status,   # queued / ringing / in-progress / completed / busy / failed / no-answer / canceled / timeout / rejected
+        "end_time":     end_time,
+        "hangup_cause": hangup_cause,
+    })
+
+
 # ═══════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════
 
@@ -1221,7 +1348,7 @@ async def send_form_email_route(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════════
-# NEW: UPGRADE #18 — /api/call-live-facts
+# UPGRADE #18 — /api/call-live-facts
 # Receives live-call facts/history/outcome from server.py so that
 # in-call data isn't lost when a call drops before the post-call
 # recording pipeline runs (or if that pipeline fails/is delayed).
@@ -1254,7 +1381,7 @@ async def post_call_live_facts(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════════
-# NEW — /api/call-transcript
+# /api/call-transcript
 # Replaces the record-download-transcribe pipeline for the normal
 # case: server.py already has the full transcript as text (built
 # live from Deepgram's ConversationText events), so this skips

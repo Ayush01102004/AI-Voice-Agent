@@ -27,12 +27,15 @@ import os
 import queue as sync_queue
 import threading
 import time
+import uuid  # NEW — dash_id correlation token, bridges request_uuid → real Plivo CallUUID
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote  # NEW — encode lead_name for the answer_url / ws_url query strings
 
 import aiohttp
 import plivo
 from aiohttp import web
+from aiohttp_cors import ResourceOptions, setup as cors_setup
 from deepgram import DeepgramClient
 from deepgram.agent.v1.types import (
     AgentV1SendFunctionCallResponse,
@@ -50,15 +53,11 @@ from deepgram.types.speak_settings_v1 import SpeakSettingsV1
 from deepgram.types.speak_settings_v1provider import SpeakSettingsV1Provider_Deepgram
 from dotenv import load_dotenv
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 log = logging.getLogger("voice_agent")
-
-# ── Env ───────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
@@ -67,9 +66,6 @@ CALL_HANDLER_URL  = os.getenv("CALL_HANDLER_URL", "http://localhost:8000").rstri
 PORT              = int(os.getenv("PORT", "5002"))
 PLIVO_AUTH_ID     = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN  = os.getenv("PLIVO_AUTH_TOKEN", "")
-# NEW: same var call_handler.py uses for the Plivo Application's answer_url —
-# reused here so the CLI dialer (_cli_dialer_loop) can derive the public
-# host without needing an in-flight request to read headers from.
 PLIVO_ANSWER_URL  = os.getenv("PLIVO_ANSWER_URL", "")
 INTERNAL_API_KEY  = os.getenv("INTERNAL_API_KEY", "")  # shared secret for calling call_handler.py
 
@@ -80,8 +76,6 @@ if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
 
 plivo_client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
 KEEPALIVE_INTERVAL_S      = 8.0
 FRAME_DURATION_S          = 0.020
 SILENCE_THRESHOLD         = 80.0
@@ -91,7 +85,7 @@ AMD_MAX_WAIT_S            = 8.0
 WARNING_DURATION_S        = 4 * 60
 MAX_CALL_DURATION_S       = 6 * 60
 RECONNECT_DELAYS: List[float] = [0.0, 2.0, 5.0]
-HISTORY_MAX_TURNS         = 30
+# HISTORY_MAX_TURNS         = 30
 HISTORY_REPLAY_TURNS      = 8
 SEND_QUEUE_MAXSIZE        = 200
 CONFIG_FETCH_RETRIES      = 3
@@ -101,8 +95,6 @@ VOICEMAIL_PHRASES = frozenset([
     "leave a message", "leave your message", "after the tone", "after the beep",
     "not available", "please record", "voicemail", "voice mail",
 ])
-
-# ── Enums ─────────────────────────────────────────────────────────────────────
 
 class CallState(str, Enum):
     VERIFY_IDENTITY  = "VERIFY_IDENTITY"
@@ -129,11 +121,7 @@ class CallOutcome(str, Enum):
     IVR                = "IVR"
     CALL_DROPPED       = "CALL_DROPPED"
 
-# ── Deepgram client ───────────────────────────────────────────────────────────
-
 deepgram_client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
-
-# ── μ-law RMS ─────────────────────────────────────────────────────────────────
 
 def _build_ulaw_table() -> List[int]:
     table = []
@@ -153,8 +141,6 @@ def ulaw_rms(data: bytes) -> float:
     if not data:
         return 0.0
     return math.sqrt(sum(_ULAW_TABLE[b] ** 2 for b in data) / len(data))
-
-# ── LLM function definitions ──────────────────────────────────────────────────
 
 FUNCTIONS: List[Dict] = [
     {
@@ -203,8 +189,6 @@ FUNCTIONS: List[Dict] = [
     },
 ]
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-
 _BASE_PROMPT = """
 You are a friendly outbound sales caller from Inbox Infotech. Agent name: {agent_name}.
 Speak naturally on a real-time phone call. Keep replies to 1-2 sentences. Warm, not pushy.
@@ -251,9 +235,12 @@ def build_system_prompt(agent_name: str, lead_name: Optional[str]) -> str:
     )
 
 def build_greeting(lead_name: Optional[str]) -> str:
+    # NEW — no more hardcoded "Sumit Sir" fallback. When no real customer
+    # name is available for this call, use the same generic unknown-lead
+    # line as VERIFY_IDENTITY in _BASE_PROMPT, instead of a fake name.
     if lead_name:
         return f"Hello, may I please speak with {lead_name}?"
-    return "Hello, is this a good time to speak with the person who handles technology decisions?"
+    return "Hello, is this a good time to speak with you?"
 
 def build_dg_settings(system_prompt: str, agent_name: str, lead_name: Optional[str]) -> AgentV1Settings:
     return AgentV1Settings(
@@ -311,8 +298,6 @@ Last {len(replay)} turns (most recent last):
     recovered.agent.greeting = None
     return recovered
 
-# ── Session dataclass ─────────────────────────────────────────────────────────
-
 class Session:
     """
     All mutable state for one call, keyed by call_sid.
@@ -322,37 +307,22 @@ class Session:
     """
 
     __slots__ = (
-        # identity
         "call_sid", "stream_sid", "agent_id", "agent_id_hint",
-        "to_number", "from_number",
-        # deepgram
+        "to_number", "from_number", "lead_name_hint",
         "_cm", "agent_conn", "dg_lock",
-        # queues
         "send_q", "audio_queue",
-        # tasks (asyncio, cancelled on cleanup)
         "audio_sender_task", "keepalive_task", "listener",
         "duration_task", "amd_task", "reconnect_lock",
-        # barge-in / audio gen
         "agent_speaking", "generation_id",
-        # silence / ghost
         "silence_seconds", "ghost_fired",
-        # AMD
         "call_type", "amd_speech_start", "amd_done",
-        # call state machine
         "call_state",
-        # graceful hangup
         "pending_hangup",
-        # outcome
         "outcome",
-        # duration
         "call_start_time", "warning_sent",
-        # memory
         "history", "facts",
-        # settings (for reconnect)
         "dg_settings",
-        # loop ref
         "loop",
-        # thread lock
         "lock",
     )
 
@@ -363,6 +333,7 @@ class Session:
         self.agent_id_hint   = ""
         self.to_number       = ""
         self.from_number     = ""
+        self.lead_name_hint  = ""  # NEW — per-call customer name, from outbound-call request → answer_url → ws query
         self._cm             = None
         self.agent_conn      = None
         self.dg_lock         = threading.Lock()
@@ -386,7 +357,7 @@ class Session:
         self.outcome: Optional[str] = None
         self.call_start_time: Optional[float] = None
         self.warning_sent    = False
-        self.history: collections.deque = collections.deque(maxlen=HISTORY_MAX_TURNS)
+        self.history: collections.deque = collections.deque()
         self.facts: Dict[str, Any] = {
             "lead_name": None, "company": None,
             "budget": None,    "timeline": None,
@@ -396,14 +367,21 @@ class Session:
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.lock = threading.Lock()
 
-# ── Session registry (keyed by call_sid) ─────────────────────────────────────
-
 _sessions: Dict[str, Session] = {}
-# NEW: tracks call_uuids that have already received a Record+Stream
-# response from plivo_answer() — see dedupe note there.
 _answered_call_uuids: set = set()
 
-# ── Structured logging ────────────────────────────────────────────────────────
+# NEW — bridges our own dash_id (embedded on answer_url when we place the
+# call) to Plivo's REAL CallUUID (only known once plivo_answer() fires).
+# Plivo's outbound calls.create() only ever returns request_uuid
+# synchronously — a DIFFERENT identifier that calls.get() and the
+# CallUUID webhook param do not accept. Without this bridge, every
+# call_uuid handed to the dashboard was actually a request_uuid, so
+# every downstream poll (Plivo call-status, Supabase live_outcome) was
+# querying an id Plivo/Supabase never had a record of — guaranteed
+# stuck at Unresolved/Ringing regardless of what really happened on
+# the call.
+_dash_call_uuid_map: Dict[str, str] = {}
+_DASH_MAP_MAX = 1000
 
 def log_outcome(call_sid: str, outcome: str, reason: str) -> None:
     log.info(json.dumps({
@@ -414,13 +392,9 @@ def log_outcome(call_sid: str, outcome: str, reason: str) -> None:
 def clog(call_sid: str, msg: str) -> None:
     log.info("[%s] %s", call_sid, msg)
 
-# ── Async bridge utility ──────────────────────────────────────────────────────
-
 def run_async(coro, loop: asyncio.AbstractEventLoop) -> None:
     """Fire-and-forget coroutine from any thread."""
     asyncio.run_coroutine_threadsafe(coro, loop)
-
-# ── WS helpers ────────────────────────────────────────────────────────────────
 
 def ws_open(ws: web.WebSocketResponse) -> bool:
     try:
@@ -456,8 +430,6 @@ async def send_audio_to_plivo(ws: web.WebSocketResponse, audio: bytes, stream_id
     except Exception as e:
         log.warning("audio→plivo: %s", e)
 
-# ── Audio queue helpers ───────────────────────────────────────────────────────
-
 def enqueue_audio(q: sync_queue.Queue, raw: bytes) -> None:
     """Drop-oldest-frame strategy under backpressure."""
     try:
@@ -479,8 +451,6 @@ async def drain_audio_queue(q: asyncio.Queue) -> None:
         except asyncio.QueueEmpty:
             break
 
-# ── Deepgram CM (thread-safe) ─────────────────────────────────────────────────
-
 def _dg_connect(lock: threading.Lock):
     log.info("[DG-CKPT] acquiring dg_lock…")
     with lock:
@@ -497,13 +467,8 @@ def _dg_close(cm, lock: threading.Lock) -> None:
         except Exception as e:
             log.warning("dg_close: %s", e)
 
-# ── Config fetch ──────────────────────────────────────────────────────────────
-
 DEFAULT_AGENT_ID = "default"
 
-# NEW: config cache is now keyed per agent_id so 10 personas served by one
-# deployment each get independent cache entries/TTLs instead of fighting
-# over one global config.
 _config_cache: Dict[str, Dict[str, Any]] = {}       # {agent_id: {...}}
 _config_cache_ts: Dict[str, float] = {}              # {agent_id: monotonic_ts}
 _config_cache_lock = asyncio.Lock()  # NEW: prevents thundering-herd concurrent fetches
@@ -512,8 +477,6 @@ _CONFIG_CACHE_TTL_S = 60.0
 async def fetch_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = False) -> Dict[str, Any]:
     global _config_cache, _config_cache_ts
 
-    # NEW: lock wraps the whole check+fetch so concurrent callers don't all
-    # hit CALL_HANDLER_URL at once when cache expires under load.
     async with _config_cache_lock:
         now       = time.monotonic()
         cached    = _config_cache.get(agent_id)
@@ -543,10 +506,6 @@ async def fetch_agent_config(agent_id: str = DEFAULT_AGENT_ID, force: bool = Fal
         log.warning("config fetch failed for agent_id=%s — using cache or defaults", agent_id)
         return _config_cache.get(agent_id, {})
 
-
-# NEW: resolve which agent_id a call belongs to, based on the Telnyx "to"
-# number. Cached briefly — call volume shouldn't hammer call_handler for
-# a mapping that changes maybe once a week.
 _phone_map_cache: Dict[str, str] = {}
 _phone_map_cache_ts: float = 0.0
 _PHONE_MAP_TTL_S = 300.0
@@ -603,22 +562,12 @@ async def resolve_agent_for_call(to_number: str) -> Optional[str]:
     log.error("NO AGENT MAPPED for to=%s — call cannot be routed", to_number)
     return None
 
-# ── Call result persistence ───────────────────────────────────────────────────
-# NEW: hook so lead facts + transcript survive even if the call drops before
-# an explicit end_conversation() call. Wire this to your actual Supabase
-# client/table — left as a safe no-op + log if not yet implemented, so
-# _cleanup() never breaks even before you wire persistence in.
-
 async def save_call_result(
     call_sid: str,
     facts: Dict[str, Any],
     outcome: Optional[str],
     history: List[Dict[str, str]],
 ) -> None:
-    # CHANGED: no longer a stub. POSTs to call_handler.py's
-    # /api/call-live-facts, which performs the actual Supabase write.
-    # server.py never touches the DB directly — call_handler.py stays
-    # the single writer to the "calls" table.
     headers = {"X-Internal-Key": INTERNAL_API_KEY} if INTERNAL_API_KEY else {}
     try:
         async with aiohttp.ClientSession() as sess:
@@ -637,7 +586,6 @@ async def save_call_result(
                     clog(call_sid, f"save_call_result HTTP {resp.status}")
     except Exception as e:
         clog(call_sid, f"save_call_result failed: {e}")
-
 
 async def save_call_transcript(
     call_sid:      str,
@@ -679,8 +627,6 @@ async def save_call_transcript(
                     clog(call_sid, "save_call_transcript OK — Groq scoring queued")
     except Exception as e:
         clog(call_sid, f"save_call_transcript failed: {e}")
-
-# ── Background tasks ──────────────────────────────────────────────────────────
 
 async def keepalive_loop(s: Session) -> None:
     try:
@@ -776,10 +722,6 @@ async def duration_guard(ws: web.WebSocketResponse, s: Session) -> None:
         clog(s.call_sid, "hard duration limit reached")
         log_outcome(s.call_sid, CallOutcome.CALL_DROPPED, "hard duration limit")
 
-        # CHANGED: hard limit now speaks a closing line instead of dropping
-        # silently. Reuses the same InjectAgentMessage + pending_hangup path
-        # as the 4-min warning, so AgentAudioDone still drives the graceful
-        # hangup timing. Falls back to old immediate-drop if inject fails.
         socket = s.agent_conn
         injected = False
         if socket:
@@ -820,8 +762,6 @@ async def _perform_hangup(ws: web.WebSocketResponse, call_sid: str) -> None:
     except Exception:
         pass
 
-# ── Threads ───────────────────────────────────────────────────────────────────
-
 def media_sender_thread(s: Session) -> None:
     clog(s.call_sid, "media-sender started")
     try:
@@ -847,8 +787,6 @@ async def audio_sender_task(ws: web.WebSocketResponse, s: Session) -> None:
                 await send_audio_to_plivo(ws, audio, s.stream_sid)
     except asyncio.CancelledError:
         pass
-
-# ── Function call handler ─────────────────────────────────────────────────────
 
 def _send_fn_response(socket, fn_id: str, fn_name: str, content: Dict) -> None:
     try:
@@ -902,8 +840,6 @@ def handle_fn(socket, fn, s: Session, call_sid: str, close_ws: Callable) -> None
     else:
         _send_fn_response(socket, fn.id, fn.name, {"success": False, "error": f"unknown fn: {fn.name}"})
 
-# ── Agent listener thread ─────────────────────────────────────────────────────
-
 def agent_listener_thread(
     socket,
     ws: web.WebSocketResponse,
@@ -921,7 +857,6 @@ def agent_listener_thread(
 
     try:
         for msg in socket:
-            # Raw TTS audio bytes
             if isinstance(msg, bytes):
                 with s.lock:
                     s.agent_speaking = True
@@ -1011,8 +946,6 @@ def agent_listener_thread(
         run(s.audio_queue.put(None))
         run(ws.close())
 
-# ── Reconnect ─────────────────────────────────────────────────────────────────
-
 def _start_media_sender(s: Session) -> None:
     threading.Thread(
         target=media_sender_thread, args=(s,),
@@ -1035,20 +968,14 @@ async def _reconnect_deepgram(ws: web.WebSocketResponse, s: Session) -> bool:
                     s._cm        = cm
                     s.agent_conn = socket
 
-                # Replace send queue + sender thread
                 if old_sq := s.send_q:
                     old_sq.put(None)
                 s.send_q = sync_queue.Queue(maxsize=SEND_QUEUE_MAXSIZE)
-                # NOT started here — same race as initial connect. New
-                # listener below resends Settings on Welcome and starts
-                # the sender itself on SettingsApplied.
 
-                # Replace keepalive
                 if old_ka := s.keepalive_task:
                     old_ka.cancel()
                 s.keepalive_task = asyncio.ensure_future(keepalive_loop(s))
 
-                # Replace listener with recovery settings
                 recovery = build_recovery_settings(s, s.dg_settings)
                 if old_l := s.listener:
                     old_l.cancel()
@@ -1067,16 +994,11 @@ async def _reconnect_deepgram(ws: web.WebSocketResponse, s: Session) -> bool:
     await ws.close()
     return False
 
-# ── Session startup ───────────────────────────────────────────────────────────
-
 async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> bool:
     start      = data.get("start", {})
     stream_sid = start.get("streamId") or data.get("streamId", "")
     call_sid   = start.get("callId") or stream_sid
 
-    # CHANGED: agent_id was resolved once already, at answer-time, in
-    # plivo_answer() — it rode here via the WS URL's query string (see
-    # plivo_ws_handler) rather than a second DB round-trip per call.
     agent_id_hint = s.agent_id_hint
 
     s.stream_sid      = stream_sid
@@ -1087,16 +1009,23 @@ async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> b
     clog(call_sid, "call started")
 
     try:
-        # [CHECKPOINT 1] agent resolution
         agent_id      = agent_id_hint or await resolve_agent_id(None)
         s.agent_id    = agent_id
         clog(call_sid, f"[CKPT1] routed to agent_id={agent_id}")
 
-        # [CHECKPOINT 2] config fetch
-        cfg           = await fetch_agent_config(agent_id)
-        clog(call_sid, f"[CKPT2] config fetched — keys={list(cfg.keys())}")
+        clog(call_sid, "[CKPT2+3] fetching config + connecting to Deepgram…")
+        cfg, (cm, socket) = await asyncio.gather(
+            fetch_agent_config(agent_id),
+            asyncio.to_thread(_dg_connect, s.dg_lock),
+        )
+        clog(call_sid, f"[CKPT2] config ready — keys={list(cfg.keys())}")
+        clog(call_sid, "[CKPT3] Deepgram connected OK")
+
         agent_name    = cfg.get("agent_name", "").strip() or "Assistant"
-        lead_name     = cfg.get("lead_name",  "").strip() or None
+        # NEW — per-call customer name (from dashboard "Place Call" / batch
+        # sheet, threaded through answer_url → ws query → s.lead_name_hint)
+        # takes priority over the static per-agent agent_config.lead_name.
+        lead_name     = s.lead_name_hint.strip() or cfg.get("lead_name", "").strip() or None
         system_prompt = cfg.get("system_prompt", "").strip() or build_system_prompt(agent_name, lead_name)
         settings      = build_dg_settings(system_prompt, agent_name, lead_name)
         clog(call_sid, f"[CKPT2b] agent_name={agent_name} lead_name={lead_name} prompt_len={len(system_prompt)}")
@@ -1105,21 +1034,12 @@ async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> b
         if lead_name:
             s.facts["lead_name"] = lead_name
 
-        # [CHECKPOINT 3] Deepgram connect — most likely failure point if
-        # nothing prints past here: DEEPGRAM_API_KEY invalid/missing,
-        # network block, or SDK version mismatch.
-        clog(call_sid, "[CKPT3] connecting to Deepgram…")
-        cm, socket = await asyncio.to_thread(_dg_connect, s.dg_lock)
         s._cm        = cm
         s.agent_conn = socket
-        clog(call_sid, "[CKPT3b] Deepgram connected OK")
 
         s.send_q      = sync_queue.Queue(maxsize=SEND_QUEUE_MAXSIZE)
         s.audio_queue = asyncio.Queue()
 
-        # [CHECKPOINT 4] tasks spun up — media sender now starts itself
-        # inside the listener on SettingsApplied (not here), so it can
-        # never send audio to DG before Settings is acked.
         clog(call_sid, "[CKPT4] tasks starting")
 
         s.audio_sender_task = asyncio.ensure_future(audio_sender_task(ws, s))
@@ -1139,11 +1059,6 @@ async def _start_session(ws: web.WebSocketResponse, s: Session, data: Dict) -> b
         log_outcome(call_sid, CallOutcome.CALL_DROPPED, f"setup error: {e}")
         s.outcome = CallOutcome.CALL_DROPPED
         return False
-
-# ── Media frame processing ────────────────────────────────────────────────────
-# CHANGED: split into _should_analyze / _check_ghost_call / _check_amd so the
-# "not s.agent_speaking" gate is checked once, rms computed once, and each
-# detector (ghost / AMD) is an independent, testable function.
 
 def _should_analyze(s: Session) -> bool:
     """Skip rms calc entirely once both detectors are done and agent isn't speaking."""
@@ -1191,8 +1106,6 @@ def _process_media(ws: web.WebSocketResponse, s: Session, raw: bytes, loop: asyn
     _check_ghost_call(ws, s, rms, loop)
     _check_amd(ws, s, rms, loop)
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-
 async def _cleanup(s: Session) -> None:
     call_sid = s.call_sid
     _sessions.pop(call_sid, None)
@@ -1223,16 +1136,11 @@ async def _cleanup(s: Session) -> None:
     if cm := s._cm:
         await asyncio.to_thread(_dg_close, cm, s.dg_lock)
 
-    # NEW: persist lead facts + transcript even if end_conversation() was
-    # never called (crash / drop / hard duration limit).
     try:
         await save_call_result(call_sid, dict(s.facts), s.outcome, list(s.history))
     except Exception as e:
         clog(call_sid, f"save_call_result error: {e}")
 
-    # NEW: text-transcript pipeline replaces the old record-download-
-    # transcribe flow entirely — sends s.history straight to Groq via
-    # call_handler.py's /api/call-transcript.
     try:
         duration = time.monotonic() - s.call_start_time if s.call_start_time else 0.0
         await save_call_transcript(
@@ -1243,15 +1151,6 @@ async def _cleanup(s: Session) -> None:
         clog(call_sid, f"save_call_transcript error: {e}")
 
     clog(call_sid, f"cleanup done — outcome={s.outcome}")
-
-# ── Plivo answer webhook ──────────────────────────────────────────────────────
-# CHANGED: entirely new for Plivo. Returns XML (not TeXML) with a bidirectional
-# <Stream> for the live AI conversation. No <Record>/audio download — the
-# transcript is sent as text (s.history) to call_handler.py's
-# /api/call-transcript at cleanup instead.
-# agent_id is resolved ONCE here (not per audio frame) and baked into the
-# Stream's <Parameter> so plivo_ws_handler() below reads it straight off
-# the start event with zero extra network round-trips.
 
 async def _verify_plivo_signature(request: web.Request) -> Dict[str, str]:
     """
@@ -1269,10 +1168,6 @@ async def _verify_plivo_signature(request: web.Request) -> Dict[str, str]:
         log.warning("plivo webhook missing signature headers — rejecting")
         raise web.HTTPForbidden(reason="Missing Plivo signature headers")
 
-    # Behind a reverse proxy / tunnel, request.url reflects the local
-    # (http://127.0.0.1:PORT/...) view, not the public HTTPS URL Plivo
-    # actually signed the request against — rebuild from the Host header
-    # (which the proxy/tunnel does forward correctly) to match.
     host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
     scheme = request.headers.get("X-Forwarded-Proto", "https")
     url = f"{scheme}://{host}{request.path_qs}"
@@ -1295,13 +1190,6 @@ async def plivo_answer(request: web.Request) -> web.Response:
     to_number = params.get("To", "")
     from_number = params.get("From", "")
 
-    # DEDUPE: Plivo has been observed hitting answer_url twice for the same
-    # call_uuid on outbound calls (~1s apart). Re-issuing <Record> on a
-    # call that already has one active causes Plivo to tear the call down
-    # right after pickup — matches the "call ends immediately" symptom.
-    # First hit proceeds normally and marks the call_uuid seen; any repeat
-    # hit for that same call_uuid gets a harmless no-op response instead
-    # of a second Record+Stream.
     if call_uuid and call_uuid in _answered_call_uuids:
         clog(call_uuid, f"DUPLICATE answer webhook — to={to_number} — ignoring, call already answered")
         return web.Response(
@@ -1310,25 +1198,24 @@ async def plivo_answer(request: web.Request) -> web.Response:
         )
     if call_uuid:
         _answered_call_uuids.add(call_uuid)
-        # bound growth — call_uuids are one-shot, safe to drop oldest once large
         if len(_answered_call_uuids) > 500:
             _answered_call_uuids.pop()
 
-    # OUTBOUND: for calls we initiate ourselves (see /api/outbound-call),
-    # the answer_url carries an explicit ?agent_id=... query param — this
-    # takes priority and skips the To-based lookup entirely, because on
-    # outbound legs Plivo's "To" is the customer's number, not one of our
-    # Plivo numbers, so resolve_agent_for_call() could never match it.
-    # INBOUND calls have no agent_id on the query string, so they fall
-    # through to the existing strict number-to-agent binding.
+    # NEW — this is the FIRST point the real Plivo CallUUID exists. Record
+    # it against our own dash_id (set on the answer_url by
+    # place_outbound_call) so /api/outbound-call and /api/resolve-call-uuid
+    # can hand the dashboard the id that actually works for polling.
+    dash_id = request.query.get("dash_id", "")
+    if dash_id and call_uuid:
+        _dash_call_uuid_map[dash_id] = call_uuid
+        if len(_dash_call_uuid_map) > _DASH_MAP_MAX:
+            _dash_call_uuid_map.pop(next(iter(_dash_call_uuid_map)))
+
     explicit_agent_id = request.query.get("agent_id", "")
     if explicit_agent_id:
         agent_id = explicit_agent_id
         clog(call_uuid, f"answer webhook (outbound) — to={to_number} → agent_id={agent_id}")
     else:
-        # STRICT number-to-agent binding: this number must be explicitly
-        # assigned to an agent. No fallback — unmapped number = call
-        # rejected, not silently routed to a default/random agent.
         agent_id = await resolve_agent_for_call(to_number)
         if agent_id is None:
             clog(call_uuid, f"REJECTED — no agent mapped for to={to_number}")
@@ -1338,28 +1225,22 @@ async def plivo_answer(request: web.Request) -> web.Response:
             )
         clog(call_uuid, f"answer webhook — to={to_number} → agent_id={agent_id}")
 
+    asyncio.ensure_future(fetch_agent_config(agent_id))
+
+    # NEW — per-call customer name, set by place_outbound_call() on the
+    # answer_url query string; forwarded straight through to the WS URL
+    # so _start_session can read it as s.lead_name_hint.
+    lead_name_q = request.query.get("lead_name", "")
+
     host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", f"localhost:{PORT}")
     ws_url = (
         f"wss://{host}/ws/plivo?agent_id={agent_id}&amp;call_uuid={call_uuid}"
         f"&amp;to={to_number}&amp;from={from_number}"
+        f"&amp;lead_name={quote(lead_name_q)}"
     )
     clog(call_uuid, f"ws_url={ws_url}")
     stream_status_url = f"{CALL_HANDLER_URL}/plivo/stream-status"
 
-    # CHANGED: agent_id rides in the WS URL's query string, not Plivo's
-    # <Stream extraHeaders="..."> attribute — extraHeaders values are
-    # restricted to [A-Z][a-z][0-9] only, which would silently mangle
-    # agent_ids containing underscores (e.g. "sales_us"). A query param
-    # on the WS URL has no such restriction and is the pattern Plivo's
-    # own docs recommend for passing custom data to a stream endpoint.
-
-    # <Record> REMOVED — we no longer download/transcribe the mp3. The
-    # transcript already exists live from Deepgram's ConversationText
-    # events (s.history) and gets POSTed as text directly to
-    # call_handler.py's /api/call-transcript at cleanup. This also
-    # removes the dependency on tunnel B being reachable mid-call for
-    # Record's action URL, and the earlier 403-on-download problem goes
-    # away entirely since nothing downloads audio anymore.
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>'
@@ -1372,17 +1253,10 @@ async def plivo_answer(request: web.Request) -> web.Response:
     )
     return web.Response(text=xml, content_type="application/xml")
 
-# ── Outbound call trigger ──────────────────────────────────────────────────────
-# NEW: shared core — takes a destination number + agent_id, looks up that
-# agent's own Plivo number (call_handler.py's /api/number-for-agent) to
-# use as caller ID, then places the call via Plivo's REST API with an
-# answer_url carrying ?agent_id=... explicitly — see plivo_answer() above
-# for why this is required (outbound "To" = customer number, can't be
-# used for routing). Used by both the HTTP endpoint and the console
-# dialer prompt below, so both paths stay identical.
-async def place_outbound_call(to_number: str, agent_id: str, host: str) -> Dict[str, Any]:
+async def place_outbound_call(to_number: str, agent_id: str, host: str, lead_name: str = "") -> Dict[str, Any]:
     to_number = (to_number or "").strip()
     agent_id  = (agent_id or "").strip()
+    lead_name = (lead_name or "").strip()  # NEW — per-call customer name
     if not to_number or not agent_id:
         return {"error": "'to' and 'agent_id' are required"}
 
@@ -1402,7 +1276,15 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str) -> Dict[
     if not from_number:
         return {"error": f"agent_id={agent_id} has no Plivo number assigned — assign one in Agent Profiles first"}
 
-    answer_url = f"https://{host}/plivo/answer?agent_id={agent_id}"
+    # NEW — dash_id is OUR correlation token (Plivo doesn't echo request_uuid
+    # back to us anywhere), embedded on the answer_url so plivo_answer() can
+    # bridge it to the real CallUUID the instant it fires.
+    dash_id = uuid.uuid4().hex
+
+    # lead_name travels on the answer_url query string (Plivo calls this URL
+    # back once the callee picks up), so plivo_answer() can pick it up and
+    # forward it to the WS session, same call every time.
+    answer_url = f"https://{host}/plivo/answer?agent_id={agent_id}&lead_name={quote(lead_name)}&dash_id={dash_id}"
 
     try:
         result = await asyncio.to_thread(
@@ -1416,10 +1298,54 @@ async def place_outbound_call(to_number: str, agent_id: str, host: str) -> Dict[
         log.error("outbound call create failed — to=%s agent_id=%s: %s", to_number, agent_id, e)
         return {"error": f"Plivo call create failed: {e}"}
 
-    call_uuid = getattr(result, "request_uuid", None) or (result.get("request_uuid") if isinstance(result, dict) else None)
-    log.info("outbound call placed — to=%s from=%s agent_id=%s call_uuid=%s", to_number, from_number, agent_id, call_uuid)
-    return {"status": "ok", "to": to_number, "from": from_number, "agent_id": agent_id, "call_uuid": call_uuid}
+    request_uuid = getattr(result, "request_uuid", None) or (result.get("request_uuid") if isinstance(result, dict) else None)
 
+    # NEW — wait for plivo_answer() to resolve the REAL CallUUID via
+    # _dash_call_uuid_map. In testing this has taken 15-25s in practice
+    # (Plivo → tunnel → local dev server round trip), not the 1-3s a
+    # production deployment would usually see — the previous 6s budget
+    # was giving up and reporting "Failed" on calls that went on to
+    # connect and hold a full conversation seconds later. 25s covers the
+    # observed worst case with margin. If the callee's carrier rejects
+    # before Plivo ever dials out (bad number, blocked, etc.), plivo_answer
+    # never fires and this stays empty regardless of how long we wait —
+    # that's a real, distinct outcome (see /api/resolve-call-uuid and the
+    # dashboard's handling of a missing call_uuid), not something to fake.
+    call_uuid = None
+    for _ in range(50):  # ~25s max
+        await asyncio.sleep(0.5)
+        call_uuid = _dash_call_uuid_map.get(dash_id)
+        if call_uuid:
+            break
+
+    log.info(
+        "outbound call placed — to=%s from=%s agent_id=%s lead_name=%s request_uuid=%s call_uuid=%s",
+        to_number, from_number, agent_id, lead_name or "—", request_uuid, call_uuid or "not yet resolved",
+    )
+    return {
+        "status": "ok", "to": to_number, "from": from_number, "agent_id": agent_id, "lead_name": lead_name or None,
+        # NEW — call_uuid is now the REAL Plivo CallUUID (or null if the
+        # answer webhook hasn't fired yet). This is what the dashboard
+        # should poll /api/plivo/call-status and Supabase live_outcome
+        # with — request_uuid works for neither.
+        "call_uuid": call_uuid,
+        "request_uuid": request_uuid,  # kept for logs/debugging only — NOT valid for status lookups
+        "dash_id": dash_id,            # if call_uuid is null, the dashboard can keep resolving via /api/resolve-call-uuid
+    }
+
+async def resolve_call_uuid(request: web.Request) -> web.Response:
+    """Fallback resolver — used when the outbound-call response came back
+    with call_uuid=null (the answer webhook hadn't fired within the ~6s
+    place_outbound_call() waits). The dashboard can keep polling this with
+    the dash_id it got back until it resolves, or until it gives up and
+    marks the row as never-connected."""
+    dash_id = request.query.get("dash_id", "")
+    if not dash_id:
+        return web.json_response({"error": "dash_id is required"}, status=400)
+    call_uuid = _dash_call_uuid_map.get(dash_id)
+    if call_uuid:
+        return web.json_response({"status": "ok", "call_uuid": call_uuid})
+    return web.json_response({"status": "pending", "call_uuid": None})
 
 async def outbound_call(request: web.Request) -> web.Response:
     try:
@@ -1429,9 +1355,16 @@ async def outbound_call(request: web.Request) -> web.Response:
 
     to_number = (body.get("to") or "").strip()
     agent_id  = (body.get("agent_id") or "").strip()
-    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", f"localhost:{PORT}")
+    # NEW — optional per-call customer name from the dashboard (single dial
+    # "Customer Name" field, or batch sheet's detected name column). Goes
+    # straight to the LLM as lead_name for this call only — accepts either
+    # key so existing callers using "lead_name" keep working.
+    lead_name = (body.get("name") or body.get("lead_name") or "").strip()
+    if not PLIVO_ANSWER_URL:
+        return web.json_response({"error": "PLIVO_ANSWER_URL not set — required for outbound calls"}, status=500)
+    host = PLIVO_ANSWER_URL.split("://", 1)[-1].split("/", 1)[0]
 
-    result = await place_outbound_call(to_number, agent_id, host)
+    result = await place_outbound_call(to_number, agent_id, host, lead_name)
     if "error" not in result:
         return web.json_response(result, status=200)
     if "required" in result["error"]:
@@ -1439,51 +1372,6 @@ async def outbound_call(request: web.Request) -> web.Response:
     if "assigned" in result["error"]:
         return web.json_response(result, status=400)
     return web.json_response(result, status=502)
-
-
-# ── Console dialer prompt ───────────────────────────────────────────────────────
-# NEW: runtime CLI prompt — lets you trigger an outbound call by typing a
-# number directly in the terminal running `python server.py`, no curl/
-# Postman needed. Runs as a background task alongside the web server;
-# does not block request handling. Derives the public host from
-# PLIVO_ANSWER_URL (same domain server.py's own answer webhook uses),
-# so it works through the Cloudflare tunnel automatically. Disable by
-# setting ENABLE_CLI_DIALER=false in .env if running as a service with
-# no attached terminal (stdin would just block otherwise).
-ENABLE_CLI_DIALER = os.getenv("ENABLE_CLI_DIALER", "true").lower() == "true"
-
-async def _cli_dialer_loop():
-    if not PLIVO_ANSWER_URL:
-        log.warning("CLI dialer disabled — PLIVO_ANSWER_URL not set")
-        return
-    host = PLIVO_ANSWER_URL.split("://", 1)[-1].split("/", 1)[0]
-    print(f"\n[dialer] outbound calling ready — host={host}")
-    while True:
-        try:
-            to_number = await asyncio.to_thread(input, "[dialer] number to call (blank to skip): ")
-            to_number = to_number.strip()
-            if not to_number:
-                continue
-            agent_id = await asyncio.to_thread(input, "[dialer] agent_id [default]: ")
-            agent_id = agent_id.strip() or DEFAULT_AGENT_ID
-            result = await place_outbound_call(to_number, agent_id, host)
-            if "error" in result:
-                print(f"[dialer] FAILED: {result['error']}")
-            else:
-                print(f"[dialer] call placed — to={result['to']} from={result['from']} agent_id={result['agent_id']} call_uuid={result['call_uuid']}")
-        except (EOFError, KeyboardInterrupt):
-            log.info("CLI dialer stopped")
-            return
-        except Exception as e:
-            log.error("CLI dialer error: %s", e)
-
-
-# ── Plivo WS handler ──────────────────────────────────────────────────────────
-# CHANGED: event names "start"/"stop"/"media" are IDENTICAL to the old
-# Telnyx loop, and media.payload is read the exact same way — only the
-# "start" field paths differ (see _start_session above). agent_id comes
-# off the WS URL's query string (set in plivo_answer() above), read here
-# at upgrade time and stashed on the Session before the message loop starts.
 
 async def plivo_ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(max_msg_size=0)
@@ -1494,6 +1382,7 @@ async def plivo_ws_handler(request: web.Request) -> web.WebSocketResponse:
     s.agent_id_hint = request.query.get("agent_id", "")   # from the WS URL, see plivo_answer()
     s.to_number     = request.query.get("to", "")
     s.from_number   = request.query.get("from", "")
+    s.lead_name_hint = request.query.get("lead_name", "") # NEW — per-call customer name, see plivo_answer()
     loop            = asyncio.get_running_loop()
 
     try:
@@ -1545,8 +1434,6 @@ async def plivo_ws_handler(request: web.Request) -> web.WebSocketResponse:
 
     return ws
 
-# ── Health ────────────────────────────────────────────────────────────────────
-
 async def ping(request: web.Request) -> web.Response:
     return web.Response(text='{"status":"ok"}', content_type="application/json")
 
@@ -1561,23 +1448,25 @@ async def health(request: web.Request) -> web.Response:
     })
     return web.Response(text=body, content_type="application/json")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 async def main() -> None:
     app = web.Application()
     app.router.add_post("/plivo/answer", plivo_answer)
     app.router.add_post("/api/outbound-call", outbound_call)
+    app.router.add_get("/api/resolve-call-uuid", resolve_call_uuid)
     app.router.add_get("/ws/plivo",      plivo_ws_handler)
     app.router.add_get("/health",        health)
     app.router.add_get("/ping",          ping)
+
+    cors = cors_setup(app, defaults={
+        "*": ResourceOptions(allow_credentials=True, expose_headers="*", allow_headers="*", allow_methods="*")
+    })
+    for route in list(app.router.routes()):
+        cors.add(route)
 
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     log.info("server :%d — /plivo/answer | /ws/plivo | /health | /ping | /api/outbound-call", PORT)
-
-    if ENABLE_CLI_DIALER:
-        asyncio.create_task(_cli_dialer_loop())
 
     await asyncio.Future()
 

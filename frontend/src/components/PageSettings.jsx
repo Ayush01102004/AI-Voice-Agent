@@ -218,12 +218,12 @@ export default function PageSettings({ showToast, onConfigChange, supabase }) {
   )
 
   return (
-    <div style={{ maxWidth: 680, display: 'flex', flexDirection: 'column', gap: 20 }}>
+    <div style={{  display: 'flex', flexDirection: 'column', gap: 20 }}>
 
       {/* ── General ── */}
       <Section title="General">
         <Field label="Website">
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ maxWidth: 680,display: 'flex', gap: 8 }}>
             <SInput type="url" value={websiteLink} onChange={e => setWebsiteLink(e.target.value)} placeholder="https://www.inboxtechs.com/" />
             <IconBtn title="Open website" onClick={() => window.open(websiteLink, '_blank', 'noopener')}>
               <Globe size={15} />

@@ -12,7 +12,9 @@
     "lucide-react": "^0.383.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "recharts": "^2.10.4"
+    "react-router-dom": "^7.18.1",
+    "recharts": "^2.10.4",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.0.3",
