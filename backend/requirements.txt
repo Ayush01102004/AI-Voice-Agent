@@ -8,3 +8,9 @@ openai
 python-dotenv
 aiohttp
 groq
+supabase==2.4.2 
+plivo 
+resend
+python-multipart
+aiohttp_cors
+#npm install -D @vitejs/plugin-react@latest 
