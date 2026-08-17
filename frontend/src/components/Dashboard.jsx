@@ -26,13 +26,29 @@ const NAV = [
   { id: 'leads', icon: Users, label: 'Leads' },
   { id: 'conversations', icon: FileText, label: 'Conversations' },
   { id: 'analytics', icon: BarChart2, label: 'Analytics' },
-  { id: 'prompt', icon: MessageSquare, label: 'Agent Profiles' },
+  { id: 'prompt', icon: MessageSquare, label: 'Agent Profiles & Calling' },
   { id: 'forms', icon: ClipboardList, label: 'Forms', badgeKey: 'forms' },
   { id: 'settings', icon: Settings, label: 'Settings' },
 ]
 
+const PAGE_STORAGE_KEY = 'dashboard_active_page'
+const NAV_IDS = NAV.map(n => n.id)
+
+function loadInitialPage() {
+  try {
+    const saved = localStorage.getItem(PAGE_STORAGE_KEY)
+    return NAV_IDS.includes(saved) ? saved : 'dashboard'
+  } catch {
+    return 'dashboard'
+  }
+}
+
 export default function Dashboard() {
-  const [page, setPage] = useState('dashboard')
+  const [page, setPageState] = useState(loadInitialPage)
+  const setPage = useCallback((id) => {
+    setPageState(id)
+    try { localStorage.setItem(PAGE_STORAGE_KEY, id) } catch {}
+  }, [])
   const [records, setRecords] = useState([])
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -172,7 +188,7 @@ export default function Dashboard() {
         )}
 
         {page === 'dashboard' && <PageDashboard records={records} stats={stats} loading={loading} filter={filter} setFilter={setFilter} openTranscript={openTranscript} showToast={showToast} globalSearch={globalSearch} />}
-        {page === 'leads' && <PageLeads records={records} loading={loading} openTranscript={openTranscript} showToast={showToast} fetchAll={fetchAll} agentConfig={agentConfig} globalSearch={globalSearch} />}
+        {page === 'leads' && <PageLeads records={records} loading={loading} openTranscript={openTranscript} showToast={showToast} fetchAll={fetchAll} agentConfig={agentConfig} globalSearch={globalSearch} goToAgentProfiles={() => setPage('prompt')} />}
         {page === 'conversations' && <PageConversations records={records} loading={loading} openTranscript={openTranscript} globalSearch={globalSearch} />}
         {page === 'forms' && <PageForms showToast={showToast} globalSearch={globalSearch} setFormCount={setFormCount} />}
         {page === 'analytics' && <PageAnalytics records={records} stats={stats} loading={loading} />}

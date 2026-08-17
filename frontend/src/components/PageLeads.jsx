@@ -1,7 +1,7 @@
 // src/components/PageLeads.jsx
 import { useEffect, useState, useMemo } from 'react'
 import {
-  Download, X, ChevronDown, Send, PhoneCall, Handshake, Calendar, Copy,
+  Download, X, ChevronDown, ChevronLeft, ChevronRight, Send, PhoneCall, Handshake, Calendar, Copy,
 } from 'lucide-react'
 import { supabase } from '../supabaseClient'
 import styles from './Dashboard.module.css'
@@ -10,11 +10,22 @@ import {
   VisualEmptyState, StarScore, Badge, FilterBar, exportCSV,
 } from './dashboardShared'
 
-export default function PageLeads({ records, loading, openTranscript, showToast, fetchAll, agentConfig, globalSearch }) {
+export default function PageLeads({ records, loading, openTranscript, showToast, fetchAll, agentConfig, globalSearch, goToAgentProfiles }) {
   const [catFilter, setCatFilter] = useState('ALL')
   const [sortKey, setSortKey] = useState('timestamp')
   const [sortDir, setSortDir] = useState('desc')
-  const [pageSize, setPageSize] = useState(10)
+
+  // Page size persists across page navigation (localStorage) — was
+  // resetting to 10 every time the admin left and came back to Leads.
+  const [pageSize, setPageSizeState] = useState(() => {
+    try { return Number(localStorage.getItem('leads_page_size')) || 10 } catch { return 10 }
+  })
+  function setPageSize(n) {
+    setPageSizeState(n)
+    try { localStorage.setItem('leads_page_size', String(n)) } catch {}
+    setCurrentPage(1)
+  }
+  const [currentPage, setCurrentPage] = useState(1)
   const [detail, setDetail] = useState(null)
   const [notes, setNotes] = useState([])
   const [noteInput, setNoteInput] = useState('')
@@ -39,7 +50,16 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
       })
   }, [records, catFilter, globalSearch, sortKey, sortDir])
 
-  const paged = useMemo(() => filtered.slice(0, pageSize), [filtered, pageSize])
+  const paged = useMemo(() => filtered.slice((currentPage - 1) * pageSize, currentPage * pageSize), [filtered, pageSize, currentPage])
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize))
+
+  // Filters/search/sort changing the result set should snap back to page 1.
+  useEffect(() => { setCurrentPage(1) }, [catFilter, globalSearch, sortKey, sortDir])
+  // If the current page falls off the end (e.g. filtered set shrank), pull it back.
+  useEffect(() => { if (currentPage > totalPages) setCurrentPage(totalPages) }, [totalPages, currentPage])
+
+  const pageStart = filtered.length === 0 ? 0 : (currentPage - 1) * pageSize + 1
+  const pageEnd = Math.min(currentPage * pageSize, filtered.length)
 
   function toggleSort(key) {
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
@@ -92,6 +112,16 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
     fetchAll()
   }
 
+  // Follow-up Call: stash the number (+ name) for the Agent Profiles page's
+  // single-call box to pick up, then jump there — admin just hits Call.
+  function callFollowUp(lead) {
+    sessionStorage.setItem('pendingCallNumber', lead.to_number || '')
+    sessionStorage.setItem('pendingCallName', lead.name || '')
+    markFollowUp(lead.call_sid)
+    if (goToAgentProfiles) goToAgentProfiles()
+    else showToast('Number copied — open Agent Profiles to call')
+  }
+
   async function addNote() {
     if (!noteInput.trim() || !detail?.call_sid) return
     const { error } = await supabase.from('lead_notes').insert({
@@ -117,12 +147,30 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ display: 'flex', gap: 10, marginBottom: 14, justifyContent: 'flex-end', alignItems: 'center' }}>
           <FilterBar value={catFilter} onChange={setCatFilter} cats={['ALL', 'HOT', 'WARM', 'COLD', 'CLOSED']} />
-          <select
-            value={pageSize}
-            onChange={e => setPageSize(Number(e.target.value))}
-            style={{ background: 'var(--bg3)', border: '0.5px solid var(--border2)', borderRadius: 8, padding: '6px 10px', color: 'var(--text1)', fontSize: 12, cursor: 'pointer', outline: 'none' }}>
-            {[10, 20, 30, 40].map(n => <option key={n} value={n}>{n} per page</option>)}
-          </select>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text2)' }}>
+            Show
+            <select
+              value={pageSize}
+              onChange={e => setPageSize(Number(e.target.value))}
+              style={{ background: 'var(--bg3)', border: '0.5px solid var(--border2)', borderRadius: 8, padding: '6px 10px', color: 'var(--text1)', fontSize: 12, cursor: 'pointer', outline: 'none' }}>
+              {[10, 20, 30, 40].map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+            <span style={{ whiteSpace: 'nowrap' }}>{pageStart}-{pageEnd} of {filtered.length}</span>
+            <button
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              disabled={currentPage <= 1}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 26, height: 26, background: 'var(--bg3)', border: '0.5px solid var(--border2)', borderRadius: 6, color: 'var(--text1)', cursor: currentPage <= 1 ? 'default' : 'pointer', opacity: currentPage <= 1 ? 0.4 : 1 }}
+            >
+              <ChevronLeft size={14} />
+            </button>
+            <button
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              disabled={currentPage >= totalPages}
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 26, height: 26, background: 'var(--bg3)', border: '0.5px solid var(--border2)', borderRadius: 6, color: 'var(--text1)', cursor: currentPage >= totalPages ? 'default' : 'pointer', opacity: currentPage >= totalPages ? 0.4 : 1 }}
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
           <button onClick={() => { exportCSV(filtered, ['name', 'to_number', 'lead_category', 'lead_score', 'duration_sec', 'budget', 'decision_makers', 'timestamp', 'last_contacted_at'], 'leads'); showToast(`Exported ${filtered.length} rows`) }}
             style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 14px', background: 'var(--bg3)', border: '0.5px solid var(--border2)', borderRadius: 8, color: 'var(--text1)', fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' }}>
             <Download size={13} /> Export CSV
@@ -172,7 +220,6 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
               </tbody>
             </table>
           </div>
-          <p className={styles.tableFooter}>{paged.length} of {filtered.length} leads ({records.length} total)</p>
         </div>
       </div>
 
@@ -257,7 +304,7 @@ export default function PageLeads({ records, loading, openTranscript, showToast,
           <p style={{ color: 'var(--text2)', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Sales actions</p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
             <button
-              onClick={async () => { window.open(`tel:${detail.to_number}`); await markFollowUp(detail.call_sid) }}
+              onClick={() => callFollowUp(detail)}
               style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--green)', fontSize: 12, cursor: 'pointer', textAlign: 'left' }}>
               <PhoneCall size={13} /> Follow-up Call
             </button>

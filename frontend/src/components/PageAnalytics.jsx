@@ -14,7 +14,7 @@ const ANALYTICS_PERIODS = [
   { id: 'monthly', label: 'Monthly' },
   { id: 'yearly',  label: 'Yearly'  },
 ]
-const DOW_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+
 
 // ══════════════════════════════════════════════════════════════
 // Keyword mention mining — used for "Top interested services" chart.
@@ -78,14 +78,14 @@ function getAnalyticsPeriodConfig(period) {
   const now = new Date()
   if (period === 'weekly') {
     const cutoff = new Date(now); cutoff.setDate(cutoff.getDate() - 7)
-    return { cutoff, bucketKey: d => d.toLocaleDateString('en-IN', { weekday: 'short' }), order: DOW_LABELS }
+    return { cutoff }
   }
   if (period === 'yearly') {
     const cutoff = new Date(now); cutoff.setFullYear(cutoff.getFullYear() - 1)
-    return { cutoff, bucketKey: d => d.toLocaleDateString('en-IN', { month: 'short' }), order: ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] }
+    return { cutoff }
   }
   const cutoff = new Date(now); cutoff.setDate(cutoff.getDate() - 30)
-  return { cutoff, bucketKey: d => d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }), order: null }
+  return { cutoff }
 }
 
 function filterRecordsByPeriod(records, period) {
@@ -93,25 +93,79 @@ function filterRecordsByPeriod(records, period) {
   return records.filter(r => r.timestamp && new Date(r.timestamp) >= cutoff)
 }
 
+// ══════════════════════════════════════════════════════════════
+// Real calendar-date buckets — BUG FIX: the old version bucketed by
+// weekday name (Sun..Sat) or bare month name (Jan..Dec) with a fixed
+// order. That silently merges different calendar weeks/years into the
+// same bar — e.g. last Monday and this Monday landed in the same "Mon"
+// bucket, so the chart looked "stuck" and just swapped one bar's value
+// week to week instead of showing a real rolling week. Same flaw hit
+// the yearly view across a year boundary (Aug '25 and Aug '26 both
+// just "Aug"). Buckets are now built from actual dates going backward
+// from today, each with a unique key, so every real day/month gets its
+// own bar and nothing collides across period boundaries.
+// ══════════════════════════════════════════════════════════════
+function buildDateBuckets(period) {
+  const now = new Date()
+  const buckets = []
+  if (period === 'weekly') {
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now); d.setDate(d.getDate() - i)
+      buckets.push({
+        key: d.toDateString(),
+        label: `${d.toLocaleDateString('en-IN', { weekday: 'short' })} ${d.getDate()}`,
+      })
+    }
+  } else if (period === 'yearly') {
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+      buckets.push({
+        key: `${d.getFullYear()}-${d.getMonth()}`,
+        label: d.toLocaleDateString('en-IN', { month: 'short', year: '2-digit' }),
+      })
+    }
+  } else {
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(now); d.setDate(d.getDate() - i)
+      buckets.push({
+        key: d.toDateString(),
+        label: d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+      })
+    }
+  }
+  return buckets
+}
+
+function bucketKeyForDate(date, period) {
+  if (period === 'yearly') return `${date.getFullYear()}-${date.getMonth()}`
+  return date.toDateString()
+}
+
 function buildScoreSeries(records, period) {
-  const { bucketKey, order } = getAnalyticsPeriodConfig(period)
-  const map = {}
+  const buckets = buildDateBuckets(period)
+  const sums = {}
   records.forEach(r => {
     if (!r.timestamp) return
-    const key = bucketKey(new Date(r.timestamp))
-    if (!map[key]) map[key] = { date: key, scoreSum: 0, scoreN: 0 }
-    map[key].scoreSum += (r.lead_score || 0)
-    map[key].scoreN++
+    const key = bucketKeyForDate(new Date(r.timestamp), period)
+    if (!sums[key]) sums[key] = { scoreSum: 0, scoreN: 0 }
+    sums[key].scoreSum += (r.lead_score || 0)
+    sums[key].scoreN++
   })
-  const toRow = key => {
-    const m = map[key]
-    return { date: key, avg_score: m && m.scoreN ? +(m.scoreSum / m.scoreN).toFixed(1) : 0 }
-  }
-  if (order) return order.map(toRow)
-  return Object.keys(map)
-    .map(toRow)
-    .sort((a, b) => new Date(`1 ${a.date}`) - new Date(`1 ${b.date}`))
-    .slice(-30)
+  return buckets.map(b => {
+    const s = sums[b.key]
+    return { date: b.label, avg_score: s && s.scoreN ? +(s.scoreSum / s.scoreN).toFixed(1) : 0 }
+  })
+}
+
+function buildCallsSeries(records, period) {
+  const buckets = buildDateBuckets(period)
+  const counts = {}
+  records.forEach(r => {
+    if (!r.timestamp) return
+    const key = bucketKeyForDate(new Date(r.timestamp), period)
+    counts[key] = (counts[key] || 0) + 1
+  })
+  return buckets.map(b => ({ day: b.label, calls: counts[b.key] || 0 }))
 }
 
 // ── dropdown — reuses existing .filters / .filterBtn / .filterActive ──
@@ -152,10 +206,7 @@ export default function PageAnalytics({ records, stats, loading }) {
     return { category: cat, avg_min: +(avg / 60).toFixed(1) }
   })
 
-  const dowData = DOW_LABELS.map((d, i) => ({
-    day: d,
-    calls: periodRecords.filter(r => r.timestamp && new Date(r.timestamp).getDay() === i).length,
-  }))
+  const callsData = buildCallsSeries(periodRecords, period)
 
   const scoreOverTime = buildScoreSeries(periodRecords, period)
 
@@ -199,12 +250,14 @@ export default function PageAnalytics({ records, stats, loading }) {
         </div>
 
         <div className={styles.chartCard}>
-          <h3 className={styles.chartTitle}>Calls by day of week · {periodLabel}</h3>
+          <h3 className={styles.chartTitle}>
+            Calls per {period === 'yearly' ? 'month' : 'day'} · {periodLabel}
+          </h3>
           <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={dowData} margin={{ top: 5, right: 10, bottom: 0, left: -20 }}>
+            <BarChart data={callsData} margin={{ top: 5, right: 10, bottom: 0, left: -20 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-              <XAxis dataKey="day" tick={{ fill: 'var(--text2)', fontSize: 11 }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fill: 'var(--text2)', fontSize: 11 }} axisLine={false} tickLine={false} />
+              <XAxis dataKey="day" tick={{ fill: 'var(--text2)', fontSize: 11 }} axisLine={false} tickLine={false} interval={period === 'monthly' ? 2 : 0} />
+              <YAxis tick={{ fill: 'var(--text2)', fontSize: 11 }} axisLine={false} tickLine={false} allowDecimals={false} />
               <Tooltip content={<CustomTooltip />} />
               <Bar dataKey="calls" name="Calls" fill="var(--accent)" fillOpacity={0.8} radius={[4,4,0,0]} />
             </BarChart>
@@ -213,7 +266,7 @@ export default function PageAnalytics({ records, stats, loading }) {
 
         <div className={styles.chartCard}>
           <h3 className={styles.chartTitle}>
-            Avg lead score over time — {period === 'weekly' ? 'by day of week' : period === 'yearly' ? 'by month' : 'by day'} · {periodLabel}
+            Avg lead score over time — {period === 'yearly' ? 'by month' : 'by day'} · {periodLabel}
           </h3>
           <ResponsiveContainer width="100%" height={200}>
             <AreaChart data={scoreOverTime} margin={{ top: 5, right: 10, bottom: 0, left: -20 }}>

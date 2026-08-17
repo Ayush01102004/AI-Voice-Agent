@@ -9,10 +9,12 @@ import { CALL_HANDLER_URL } from './dashboardShared'
 // survives page navigation). This component only renders `batch`
 // (a read-only snapshot) and calls the store's exported functions.
 import {
-  useBatchStore, COUNTRY_CODES, BATCH_STATUSES, toE164,
+  useBatchStore, COUNTRY_CODES, toE164, CONCURRENCY_OPTIONS,
   setCountryCode as setBatchCountryCode, setAgentId as setBatchAgentId,
+  setConcurrency as setBatchConcurrency,
   loadFromFileInput, loadFromFilePicker, loadFromGoogleSheetCsvUrl,
-  startBatch, pauseBatch, stopBatch, exportBatchSheet,
+  startBatch, pauseBatch, stopBatch, exportBatchSheet, validateRows,
+  listCampaigns, resumeCampaign, deleteCampaign,
 } from './batchCallStore'
 
 // base URL for the voice server (server.py) — separate from
@@ -188,7 +190,7 @@ export default function PageAgentProfiles({ showToast }) {
       .select('id, prompt_value, rollback_note, created_at')
       .eq('agent_id', selectedId)
       .order('created_at', { ascending: false })
-      .limit(10)
+      .limit(3)
       .then(({ data, error }) => {
         if (!error) setRollback(data || [])
       })
@@ -230,6 +232,20 @@ export default function PageAgentProfiles({ showToast }) {
       rollback_note: 'Manual update',
     })
 
+    // Keep only the 3 most recent history rows per agent — as a new one
+    // arrives, the oldest one past 3 gets deleted. 3 old versions + the
+    // 1 currently-active system_prompt = 4 states available total.
+    const { data: allVersions } = await supabase
+      .from('prompt_versions')
+      .select('id')
+      .eq('agent_id', selectedId)
+      .order('created_at', { ascending: false })
+
+    if (allVersions && allVersions.length > 3) {
+      const idsToPrune = allVersions.slice(3).map(v => v.id)
+      await supabase.from('prompt_versions').delete().in('id', idsToPrune)
+    }
+
     setSavingPrompt(false)
     setDirty(false)
     showToast('Prompt saved ✓')
@@ -239,7 +255,7 @@ export default function PageAgentProfiles({ showToast }) {
       .select('id, prompt_value, rollback_note, created_at')
       .eq('agent_id', selectedId)
       .order('created_at', { ascending: false })
-      .limit(10)
+      .limit(3)
     setRollback(data || [])
   }
 
@@ -320,8 +336,25 @@ export default function PageAgentProfiles({ showToast }) {
     if (!dialAgentId && agents.length) setDialAgentId(agents[0].agent_id)
   }, [agents, dialAgentId])
 
+  // Pick up a "Follow-up Call" handoff from the Leads page — it stashes
+  // the lead's number (+ name) in sessionStorage before sending the admin
+  // here, so the single-call box arrives pre-filled and Call is one click.
+  useEffect(() => {
+    const pendingNumber = sessionStorage.getItem('pendingCallNumber')
+    if (!pendingNumber) return
+    const pendingName = sessionStorage.getItem('pendingCallName') || ''
+    setDialTo(pendingNumber)
+    setDialName(pendingName)
+    sessionStorage.removeItem('pendingCallNumber')
+    sessionStorage.removeItem('pendingCallName')
+    showToast('Number loaded from lead — hit Call')
+  }, [])
+
   async function placeCall() {
-    const to = toE164(dialTo, dialCountryCode)
+    // dialTo may already be a full E.164 number (e.g. handed off from the
+    // Leads page's Follow-up Call action) — don't re-mangle it with the
+    // country-code dropdown in that case.
+    const to = dialTo.trim().startsWith('+') ? dialTo.trim() : toE164(dialTo, dialCountryCode)
     if (!dialTo.trim()) { showToast('Enter a phone number to call', 'err'); return }
     if (!dialAgentId) { showToast('Select an agent', 'err'); return }
 
@@ -380,10 +413,11 @@ export default function PageAgentProfiles({ showToast }) {
   const activeRowRef = useRef(null)
 
   useEffect(() => {
-    if (batch.index >= 0 && activeRowRef.current) {
+    const first = [...batch.activeIndexes][0]
+    if (first !== undefined && activeRowRef.current) {
       activeRowRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
     }
-  }, [batch.index])
+  }, [batch.activeIndexes])
 
   useEffect(() => {
     if (!batch.agentId && agents.length) setBatchAgentId(agents[0].agent_id)
@@ -428,22 +462,94 @@ export default function PageAgentProfiles({ showToast }) {
     setSheetsLoading(false)
   }
 
+  // Resume a past campaign after a full page reload — the campaign lives
+  // in the DB (campaigns/campaign_leads/call_attempts), so it's still
+  // there even though batchCallStore's in-memory `rows` was wiped by the
+  // reload. This is the only way to get back to it.
+  const [recentCampaigns, setRecentCampaigns] = useState([])
+  const [campaignsLoading, setCampaignsLoading] = useState(false)
+  const [pickedCampaignId, setPickedCampaignId] = useState('')
+
+  async function loadRecentCampaigns() {
+    if (!batch.agentId) return
+    setCampaignsLoading(true)
+    try {
+      const list = await listCampaigns(batch.agentId, CALL_HANDLER_URL)
+      setRecentCampaigns(list)
+    } catch (e) {
+      showToast('Failed to load past campaigns: ' + e.message, 'err')
+    }
+    setCampaignsLoading(false)
+  }
+
+  useEffect(() => { loadRecentCampaigns() }, [batch.agentId])
+
+  async function handleResumePastCampaign() {
+    if (!pickedCampaignId) return
+    try {
+      await resumeCampaign(pickedCampaignId, CALL_HANDLER_URL)
+      showToast('Campaign loaded ✓ — hit Resume to continue dialing')
+    } catch (e) {
+      showToast('Resume failed: ' + e.message, 'err')
+    }
+  }
+
+  async function handleDeleteCampaign(campaignId, fileName) {
+    if (campaignId === batch.campaignId && batch.running) {
+      showToast("Can't delete the campaign that's currently running", 'err')
+      return
+    }
+    if (!window.confirm(`Delete batch "${fileName || campaignId.slice(0, 8)}"? Dialing history for it is gone for good — HOT leads already saved to your dashboard are untouched.`)) return
+    try {
+      await deleteCampaign(campaignId, CALL_HANDLER_URL)
+      if (campaignId === pickedCampaignId) setPickedCampaignId('')
+      showToast('Batch deleted ✓')
+      await loadRecentCampaigns()
+    } catch (e) {
+      showToast('Delete failed: ' + e.message, 'err')
+    }
+  }
+
   function handleStartOrResume() {
     if (!batch.rows.length) { showToast('Upload a sheet first', 'err'); return }
     if (!batch.agentId) { showToast('Select an agent', 'err'); return }
-    const resuming = batch.index >= 0
+
+    // pre-flight — check once per fresh load; skip re-checking on Resume
+    // (rows already validated, re-running would just recompute the same).
+    if (!batch.hasStarted) {
+      const pf = validateRows()
+      if (pf.invalidRows.length || pf.duplicateRows.length) {
+        const ok = window.confirm(
+          `Pre-flight: ${pf.validCount}/${pf.total} valid rows. ` +
+          `${pf.invalidRows.length} invalid number(s), ${pf.duplicateRows.length} duplicate(s) — ` +
+          `these rows will be marked Failed/skipped. Start anyway?`
+        )
+        if (!ok) return
+      }
+    }
+
+    const resuming = batch.hasStarted
     startBatch(VOICE_SERVER_URL, CALL_HANDLER_URL)
-    showToast(resuming ? 'Batch resumed' : 'Batch calling started')
+    showToast(resuming ? 'Batch resumed' : `Batch calling started — ${batch.concurrency} at a time`)
   }
 
   function handlePause() {
+    // Semantics: no new calls launch after this; any call(s) already
+    // in flight (the current wave) are left to finish naturally — see
+    // pauseBatch()/startBatch()'s wave loop in batchCallStore.js. This
+    // never hangs up a live sales conversation.
     pauseBatch()
-    showToast('Batch paused')
+    showToast(batch.activeIndexes.size ? 'Pausing — current call(s) will finish' : 'Batch paused')
   }
 
   function handleStop() {
+    // Same "let active calls finish" semantics as Pause, plus it
+    // doesn't resume — Resume starts a fresh wave picking up PENDING
+    // rows. This is NOT an emergency hangup; there is no live-call
+    // termination here, intentionally, so a Stop click never cuts off
+    // a conversation mid-sentence.
     stopBatch()
-    showToast('Batch stopped')
+    showToast(batch.activeIndexes.size ? 'Stopping — current call(s) will finish' : 'Batch stopped')
   }
 
   function handleExport() {
@@ -453,16 +559,14 @@ export default function PageAgentProfiles({ showToast }) {
   }
 
   // Colors for the real Plivo-CDR-derived statuses (batchCallStore.js
-  // BATCH_STATUSES — no more DIALING/RINGING, a row is PENDING or
-  // terminal, nothing in between).
-  const batchStatusColor = {
-    PENDING:   'var(--text3)',
-    CONNECTED: '#4ade80',
-    NO_ANSWER: 'var(--warm, #f5a623)',
-    BUSY:      'var(--warm, #f5a623)',
-    REJECTED:  'var(--hot)',
-    FAILED:    'var(--hot)',
-    UNKNOWN:   'var(--warm, #f5a623)',
+  // Status is now the raw Plivo hangup_cause (or a local Pending/Failed/
+  // Unknown placeholder) — color by a few recognizable cases, default
+  // to plain text for whatever else Plivo's log reports.
+  function batchStatusColor(status) {
+    if (status === 'Pending') return 'var(--text3)'
+    if (status === 'Failed' || status === 'Unknown') return 'var(--hot)'
+    if (status === 'Normal Hangup') return '#4ade80'
+    return 'var(--text1)'
   }
 
   const inputStyle = {
@@ -608,6 +712,21 @@ export default function PageAgentProfiles({ showToast }) {
             </select>
           </div>
 
+          <div style={{ flex: '0 0 140px' }}>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+              Concurrency
+            </label>
+            <select
+              value={batch.concurrency}
+              onChange={e => setBatchConcurrency(e.target.value)}
+              style={inputStyle}
+              disabled={batch.running}
+              title="How many calls dial at once, per wave"
+            >
+              {CONCURRENCY_OPTIONS.map(n => <option key={n} value={n}>{n} at a time</option>)}
+            </select>
+          </div>
+
           <div style={{ flex: '1 1 220px' }}>
             <label style={{ display: 'block', fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
               Sheet (.xlsx / .csv)
@@ -659,6 +778,61 @@ export default function PageAgentProfiles({ showToast }) {
           Add a "Name" column to have each row's lead name passed to the LLM automatically.
         </p>
 
+        {/* RESUME A PAST CAMPAIGN — campaigns live in the DB, so this
+            survives closing the tab entirely, unlike everything above.
+            Delete frees space once a batch is done — HOT leads are
+            already saved separately in `calls`, unaffected by this. */}
+        <div style={{ borderTop: '0.5px solid var(--border)', paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+              Past campaigns for this agent
+            </span>
+            <button
+              onClick={loadRecentCampaigns}
+              disabled={campaignsLoading}
+              title="Refresh"
+              style={{ padding: '4px 6px', background: 'var(--bg3)', border: '0.5px solid var(--border)', borderRadius: 6, color: 'var(--text2)', cursor: 'pointer' }}
+            >
+              <RefreshCw size={12} className={campaignsLoading ? styles.spin : ''} />
+            </button>
+          </div>
+
+          {campaignsLoading && recentCampaigns.length === 0 && (
+            <p style={{ fontSize: 12, color: 'var(--text3)', margin: 0 }}>Loading…</p>
+          )}
+          {!campaignsLoading && recentCampaigns.length === 0 && (
+            <p style={{ fontSize: 12, color: 'var(--text3)', margin: 0 }}>No past campaigns for this agent.</p>
+          )}
+
+          {recentCampaigns.length > 0 && (
+            <div style={{ maxHeight: 160, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {recentCampaigns.map(c => (
+                <div key={c.campaign_id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', background: 'var(--bg3)', borderRadius: 8, fontSize: 12 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ color: 'var(--text1)' }}>{c.file_name || c.campaign_id.slice(0, 8)}</span>
+                    <span style={{ color: 'var(--text3)', marginLeft: 8 }}>{c.total_leads} leads · {new Date(c.created_at).toLocaleString()}</span>
+                  </div>
+                  <button
+                    onClick={() => { setPickedCampaignId(c.campaign_id); handleResumePastCampaign() }}
+                    disabled={batch.running}
+                    style={{ padding: '5px 10px', background: 'var(--accent)', border: 'none', borderRadius: 6, color: '#fff', fontSize: 11, fontWeight: 600, cursor: 'pointer', opacity: batch.running ? 0.5 : 1 }}
+                  >
+                    Load
+                  </button>
+                  <button
+                    onClick={() => handleDeleteCampaign(c.campaign_id, c.file_name)}
+                    disabled={batch.running && c.campaign_id === batch.campaignId}
+                    title="Delete this batch"
+                    style={{ padding: '5px 8px', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 6, color: 'var(--hot)', cursor: 'pointer', opacity: (batch.running && c.campaign_id === batch.campaignId) ? 0.4 : 1 }}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {batch.rows.length > 0 && (
           <p style={{ fontSize: 11, color: 'var(--text3)', margin: 0 }}>
             {batch.fileName} — {batch.rows.length} rows — phone column: <span style={{ color: 'var(--text2)', fontFamily: 'monospace' }}>{batch.phoneKey}</span>
@@ -670,10 +844,10 @@ export default function PageAgentProfiles({ showToast }) {
           {!batch.running ? (
             <button
               onClick={handleStartOrResume}
-              disabled={!batch.rows.length || !batch.agentId}
-              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'var(--accent)', border: 'none', borderRadius: 8, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.rows.length || !batch.agentId) ? 0.6 : 1 }}
+              disabled={!batch.rows.length || !batch.agentId || batch.starting}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'var(--accent)', border: 'none', borderRadius: 8, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.rows.length || !batch.agentId || batch.starting) ? 0.6 : 1 }}
             >
-              <Play size={14} /> {batch.index >= 0 ? 'Resume' : 'Start'} Calling
+              <Play size={14} /> {batch.starting ? 'Starting…' : (batch.hasStarted ? 'Resume' : 'Start') + ' Calling'}
             </button>
           ) : (
             <button
@@ -685,8 +859,8 @@ export default function PageAgentProfiles({ showToast }) {
           )}
           <button
             onClick={handleStop}
-            disabled={!batch.running && batch.index < 0}
-            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--hot)', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.running && batch.index < 0) ? 0.5 : 1 }}
+            disabled={!batch.running && !batch.hasStarted}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 8, color: 'var(--hot)', fontSize: 13, fontWeight: 600, cursor: 'pointer', opacity: (!batch.running && !batch.hasStarted) ? 0.5 : 1 }}
           >
             <Square size={14} /> Stop
           </button>
@@ -713,29 +887,23 @@ export default function PageAgentProfiles({ showToast }) {
                 </tr>
               </thead>
               <tbody>
-                {batch.rows.map((r, i) => (
+                {(() => { var firstActiveIdx = batch.activeIndexes.size ? Math.min(...batch.activeIndexes) : -1; return batch.rows.map((r, i) => (
                   <tr
                     key={i}
-                    ref={i === batch.index ? activeRowRef : null}
-                    style={{ background: i === batch.index ? 'var(--bg3)' : 'transparent' }}
+                    ref={i === firstActiveIdx ? activeRowRef : null}
+                    style={{ background: batch.activeIndexes.has(i) ? 'var(--bg3)' : 'transparent' }}
                   >
-                    <td style={{ padding: '6px 8px' }}>{i === batch.index && batch.running && <ArrowRight size={13} color="var(--accent)" />}</td>
+                    <td style={{ padding: '6px 8px' }}>{batch.activeIndexes.has(i) && <ArrowRight size={13} color="var(--accent)" />}</td>
                     <td style={{ padding: '6px 8px', color: 'var(--text3)' }}>{r.__row}</td>
                     <td style={{ padding: '6px 8px', fontFamily: 'monospace', color: 'var(--text1)' }}>{toE164(r.__phone, batch.countryCode)}</td>
                     {batch.nameKey && <td style={{ padding: '6px 8px', color: 'var(--text2)' }}>{r[batch.nameKey] || '—'}</td>}
                     <td style={{ padding: '6px 8px' }}>
-                      <span style={{ color: batchStatusColor[r.__status] || 'var(--text3)', fontWeight: 600 }}>
-                        {BATCH_STATUSES[r.__status] || r.__status}
+                      <span style={{ color: batchStatusColor(r.__status), fontWeight: 600 }}>
+                        {r.__status}
                       </span>
                     </td>
-                    <td style={{ padding: '6px 8px' }}>
-                      <span style={{ color: batchStatusColor[r.__status] || 'var(--text3)', fontWeight: 600 }}>{r.__hangupCause}</span>
-                      {r.__hangupCause && (
-                        <span style={{ color: 'var(--text3)', marginLeft: 6, fontWeight: 400 }}>({r.__hangupCause})</span>
-                      )}
-                    </td>
                   </tr>
-                ))}
+                )) })()}
               </tbody>
             </table>
           </div>
@@ -856,6 +1024,29 @@ export default function PageAgentProfiles({ showToast }) {
         )}
       </div>
 
+      {/* CREATE FORM — sits right under Profile so the flow reads:
+          Profile + settings → Create form → Plivo numbers → Prompt */}
+      {showCreate && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, background: 'var(--bg2)', border: '0.5px solid var(--accent)', borderRadius: 12, padding: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            <input value={newId} onChange={e => setNewId(e.target.value)} placeholder="agent_id (e.g. alex)" style={inputStyle} />
+            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Display name" style={inputStyle} />
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button onClick={() => setShowCreate(false)} style={{ padding: '7px 12px', background: 'transparent', border: 'none', color: 'var(--text2)', fontSize: 12, cursor: 'pointer' }}>
+              Cancel
+            </button>
+            <button
+              onClick={createAgent}
+              disabled={creating}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 7, color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', opacity: creating ? 0.6 : 1 }}
+            >
+              <Plus size={13} /> {creating ? 'Creating…' : 'Create Agent'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* PLIVO NUMBERS CARD */}
       <div style={{ background: 'var(--bg2)', border: '0.5px solid var(--border)', borderRadius: 12, padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -918,26 +1109,11 @@ export default function PageAgentProfiles({ showToast }) {
         )}
       </div>
 
-      {/* CREATE FORM */}
-      {showCreate && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, background: 'var(--bg2)', border: '0.5px solid var(--accent)', borderRadius: 12, padding: 14 }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-            <input value={newId} onChange={e => setNewId(e.target.value)} placeholder="agent_id (e.g. alex)" style={inputStyle} />
-            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Display name" style={inputStyle} />
-          </div>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <button onClick={() => setShowCreate(false)} style={{ padding: '7px 12px', background: 'transparent', border: 'none', color: 'var(--text2)', fontSize: 12, cursor: 'pointer' }}>
-              Cancel
-            </button>
-            <button
-              onClick={createAgent}
-              disabled={creating}
-              style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', background: 'var(--accent)', border: 'none', borderRadius: 7, color: '#fff', fontSize: 12, fontWeight: 600, cursor: 'pointer', opacity: creating ? 0.6 : 1 }}
-            >
-              <Plus size={13} /> {creating ? 'Creating…' : 'Create Agent'}
-            </button>
-          </div>
-        </div>
+      {/* PROMPTS LABEL */}
+      {selectedId && (
+        <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+          Prompts for agent and prompt history
+        </span>
       )}
 
       {/* PROMPT EDITOR */}

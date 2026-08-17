@@ -14,6 +14,7 @@ import {
 const CATEGORIES = [
   { label: 'Agents',       tables: ['agents', 'agent_numbers', 'agent_config', 'prompt_versions'] },
   { label: 'Leads & Calls', tables: ['calls', 'lead_notes'] },
+  { label: 'Campaigns',    tables: ['campaigns', 'campaign_leads', 'call_attempts'] },
   { label: 'Forms',        tables: ['forms', 'form_submissions', 'form_send_log'] },
 ]
 
@@ -67,6 +68,32 @@ const TABLES = {
     readonly: ['id', 'created_at'],
     columns: ['id', 'call_sid', 'note', 'author', 'created_at'],
     types: {},
+  },
+  // ── campaigns — durable batch-calling state ────────────────────
+  campaigns: {
+    pk: 'campaign_id',
+    readonly: ['campaign_id', 'created_at'],
+    columns: ['campaign_id', 'agent_id', 'file_name', 'total_leads', 'status', 'created_at'],
+    types: { total_leads: 'number' },
+  },
+  campaign_leads: {
+    pk: 'lead_id',
+    readonly: ['lead_id', 'campaign_id'],
+    columns: ['lead_id', 'campaign_id', 'row_index', 'phone', 'name', 'raw_row', 'status'],
+    types: { raw_row: 'jsonb', row_index: 'number' },
+  },
+  call_attempts: {
+    pk: 'attempt_id',
+    // idempotency_key is what makes duplicate-call prevention work —
+    // editing it by hand would break the uniqueness it relies on, so
+    // it's readonly here same as the id/timestamp columns.
+    readonly: ['attempt_id', 'lead_id', 'campaign_id', 'idempotency_key', 'started_at'],
+    columns: [
+      'attempt_id', 'lead_id', 'campaign_id', 'attempt_number', 'idempotency_key',
+      'call_uuid', 'provider_status', 'hangup_cause', 'business_status',
+      'started_at', 'ended_at', 'failure_reason',
+    ],
+    types: { attempt_number: 'number' },
   },
   forms: {
     pk: 'id',
