@@ -209,44 +209,109 @@ Production logging defaults to **`WARNING`** — routine per-call tracing, per-r
 - Plivo signature missing/verify-failure warnings, non-JSON WS message warnings, WS loop exceptions
 - Outbound call create failures, agent-config/phone-map fetch failures, Supabase retry-exhausted errors
 
-**Suppressed by default — set `LOG_LEVEL=INFO` to see:**
-- Per-call lifecycle tracing (`clog()` in `session.py`) — answer webhook, call started/cleanup, TTS/STT reconnects, barge-in events, hangup, across `audio.py`, `tts_bridge.py`, `stt_bridge.py`, `llm_bridge.py`, `routes.py`, `call_handler_client.py`
-- `call_outcome` structured JSON lines (`session.py`)
-- `barge_in_metric` per-event structured JSON lines (`metrics.py`)
-- `Lead extracted`, campaign stale-recovery notices (`call_handler_app/lead_extraction.py`, `campaigns.py`)
-- Supabase transient-retry, hangup-webhook, and stream-status debug lines
-
-**Removed in this commit (not just suppressed):**
-- The 5-minute `barge_in_metrics_summary` background logging loop and its startup call — `/metrics` remains available on-demand, it just no longer logs itself automatically every 5 minutes
-- The server-startup route-dump log listing every registered route
-- The per-connection `WS connected — agent_id=... call_uuid=...` log line
-
-No functional endpoints, Plivo webhooks, WebSocket behavior, batch calling, AI voice logic, or error handling were changed — this commit is logging/observability only.
-
 ## Database schema (Supabase)
 
-The base schema (`final_schema.sql` — `agents`, `calls`, `agent_config`, `agent_numbers`, etc.) provisions the core tables everything above reads/writes. Batch calling's durable state lives in a second, additive migration, **`schema_campaigns.sql`**, which must be run against the same Supabase project or `call_handler_app/campaigns.py` will 500 on every request:
+Everything the backend actually reads/writes, in one idempotent script — reconstructed directly from the Supabase calls in the code (`call_handler_app/config.py`, `agent_routes.py`, `plivo_routes.py`, `lead_extraction.py`, `forms.py`, `campaigns.py`). Safe to run once, top to bottom, on a fresh Supabase project.
 
 ```sql
 -- ============================================================
--- schema_campaigns.sql — batch-calling durable state.
--- Idempotent: safe to re-run. Required by
--- backend/call_handler_app/campaigns.py — that file will 500 on
--- every request until this has been run, because none of these
--- tables/constraints exist in final_schema.sql.
---
--- The idempotency_key UNIQUE constraint is NOT optional — it is the
--- entire mechanism the duplicate-call fix in dial_lead() relies on
--- (upsert(..., on_conflict="idempotency_key", ignore_duplicates=True)
--- only works because Postgres enforces this constraint atomically).
--- Without it, dial_lead() will error at runtime, not silently misbehave.
+-- final_schema.sql — full Supabase schema for the AI Voice
+-- Agent backend (server_app + call_handler_app). Idempotent:
+-- safe to re-run. Run this in one go on a fresh project.
 -- ============================================================
 
--- gen_random_uuid() needs pgcrypto — final_schema.sql never enables it
--- (agents.agent_id is text, not uuid, so nothing already turned this on).
 create extension if not exists pgcrypto;
 
+-- ── agents ───────────────────────────────────────────────────
+-- One row per voice agent. agent_id is text (not uuid) — every
+-- FK below references it as text.
+create table if not exists public.agents (
+  agent_id     text primary key,
+  name         text,
+  phone_number text,
+  is_active    boolean not null default true,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+
+-- ── agent_config ─────────────────────────────────────────────
+-- Per-agent key/value config (system_prompt, company_name,
+-- calendly_link, followup_delay, notification_email, lead_name, ...).
+create table if not exists public.agent_config (
+  id         uuid primary key default gen_random_uuid(),
+  agent_id   text not null references public.agents (agent_id) on delete cascade,
+  key        text not null,
+  value      text,
+  created_at timestamptz not null default now(),
+  unique (agent_id, key)
+);
+
+create index if not exists idx_agent_config_agent_id on public.agent_config (agent_id);
+
+-- ── agent_numbers ────────────────────────────────────────────
+-- Which rented Plivo number is bound to which agent.
+create table if not exists public.agent_numbers (
+  number       text primary key,
+  agent_id     text not null references public.agents (agent_id) on delete cascade,
+  region       text,
+  assigned_at  timestamptz not null default now()
+);
+
+create index if not exists idx_agent_numbers_agent_id on public.agent_numbers (agent_id);
+
+-- ── calls ────────────────────────────────────────────────────
+-- One row per call. Written by server_app (live_* columns, via
+-- POST /api/call-live-facts) and by call_handler_app (everything
+-- else, after transcript/lead extraction + the hangup webhook).
+create table if not exists public.calls (
+  id               uuid primary key default gen_random_uuid(),
+  call_sid         text not null unique,          -- Plivo CallUUID
+  agent_id         text references public.agents (agent_id) on delete set null,
+  from_number      text,
+  to_number        text,
+  duration_sec     numeric,
+  transcript       text,
+  lead_category    text default 'COLD',
+  lead_score       integer default 1,
+  extracted        jsonb default '{}'::jsonb,      -- structured lead-extraction output
+  recording_url    text,
+  source           text default 'Unknown',
+  name             text,
+  company           text,
+  hangup_cause     text,
+  live_facts       jsonb,                          -- live, mid-call state from server_app
+  live_outcome     text,
+  live_history     jsonb,
+  live_updated_at  timestamptz,
+  created_at       timestamptz not null default now()
+);
+
+create index if not exists idx_calls_agent_id on public.calls (agent_id);
+create index if not exists idx_calls_created_at on public.calls (created_at desc);
+
+-- ── form_send_log ────────────────────────────────────────────
+-- Audit log for "please fill out this form" emails sent via
+-- POST /api/send-form-email — also used to dedupe rapid resends
+-- (10-minute cooldown per lead_email + form_url).
+create table if not exists public.form_send_log (
+  id           uuid primary key default gen_random_uuid(),
+  lead_id      text,
+  lead_name    text,
+  lead_email   text not null,
+  form_url     text not null,
+  sent_by      text default 'system',
+  status       text not null,                      -- 'sent' | 'failed'
+  provider_id  text,
+  error        text,
+  sent_at      timestamptz not null default now()
+);
+
+create index if not exists idx_form_send_log_email_url on public.form_send_log (lead_email, form_url);
+create index if not exists idx_form_send_log_sent_at on public.form_send_log (sent_at desc);
+
 -- ── campaigns ────────────────────────────────────────────────
+-- Batch-calling durable state. Required by call_handler_app/campaigns.py
+-- — that router 500s on every request until this section has run.
 create table if not exists public.campaigns (
   campaign_id uuid primary key default gen_random_uuid(),
   agent_id text not null references public.agents (agent_id) on delete cascade,
@@ -279,7 +344,7 @@ create index if not exists idx_campaign_leads_status on public.campaign_leads (s
 -- from started_at and never sets it explicitly anywhere in the app
 -- code, so if this default is missing, every attempt's age reads as
 -- "unknown," stale recovery silently never fires, and QUEUED rows with
--- no call_uuid can get stuck forever again — the exact bug being fixed.
+-- no call_uuid can get stuck forever.
 create table if not exists public.call_attempts (
   attempt_id uuid primary key default gen_random_uuid(),
   lead_id uuid not null references public.campaign_leads (lead_id) on delete cascade,
@@ -315,10 +380,9 @@ create index if not exists idx_call_attempts_call_uuid on public.call_attempts (
 create index if not exists idx_call_attempts_business_status on public.call_attempts (business_status);
 
 -- ── Realtime — batchCallStore.js's waitForOutcome() subscribes to
--- postgres_changes on this table. Without this, the Realtime half of
--- the fix (item 5) never fires anything and every call silently falls
--- back to the 30s-then-final-DB-check path — degraded, not broken,
--- but worth confirming this actually ran.
+-- postgres_changes on this table. Without this, every batch call
+-- silently falls back to the 30s-then-final-DB-check path instead
+-- of updating live.
 -- Guarded manually (not "ADD TABLE IF NOT EXISTS") for compatibility
 -- with Postgres <15 — Supabase's SQL editor runs a pasted script as
 -- one implicit transaction, so an unguarded failure here would roll
@@ -334,19 +398,22 @@ begin
 end $$;
 ```
 
-**Tables it adds:**
+**All 8 tables:**
 
 | Table            | Key columns                                                                 | Purpose                                                                 |
 |-------------------|------------------------------------------------------------------------------|--------------------------------------------------------------------------|
-| `campaigns`        | `campaign_id` (PK), `agent_id` (FK → `agents`), `file_name`, `total_leads`  | One row per batch-calling run                                          |
+| `agents`           | `agent_id` (PK, text), `name`, `phone_number`, `is_active`                 | One row per voice agent                                                |
+| `agent_config`     | `agent_id` (FK), `key`, `value` — unique per (agent_id, key)               | Per-agent config (system prompt, company name, Calendly link, etc.)    |
+| `agent_numbers`    | `number` (PK), `agent_id` (FK), `region`                                   | Which rented Plivo number belongs to which agent                       |
+| `calls`            | `call_sid` (unique), `agent_id` (FK), `lead_category`, `lead_score`, `extracted` (jsonb), `hangup_cause`, `live_*` | One row per call — lead extraction results + live mid-call state       |
+| `form_send_log`    | `lead_email`, `form_url`, `status`, `sent_at`                              | Audit log + dedupe window for "fill out this form" emails              |
+| `campaigns`        | `campaign_id` (PK), `agent_id` (FK → `agents`), `file_name`, `total_leads` | One row per batch-calling run                                          |
 | `campaign_leads`   | `lead_id` (PK), `campaign_id` (FK), `row_index`, `phone`, `raw_row` (jsonb), `status` | One row per uploaded lead in a campaign                                |
-| `call_attempts`    | `attempt_id` (PK), `lead_id` (FK), `campaign_id` (FK), `idempotency_key` (unique), `business_status`, `call_uuid`, `hangup_cause`, `started_at` | One row per dial attempt against a lead; drives dedupe, stale-attempt recovery, and the batch UI's realtime status via `call_attempts_idempotency_key_key` and the `supabase_realtime` publication |
-
-Run it once per Supabase project, after `final_schema.sql` — it's idempotent (`create table if not exists`, guarded `do $$` blocks), so re-running it is safe.
+| `call_attempts`    | `attempt_id` (PK), `lead_id` (FK), `campaign_id` (FK), `idempotency_key` (unique), `business_status`, `call_uuid`, `hangup_cause`, `started_at` | One row per dial attempt; drives dedupe, stale-attempt recovery, and the batch UI's realtime status |
 
 ## Notes
 
 - `plivo_answer()` is the first point the real Plivo `CallUUID` exists — outbound-call responses and status polling use the `dash_id` correlation token until then.
 - `call_handler.py` is the only service that writes to Supabase; `server.py` forwards live-call facts to it via `/api/call-live-facts` rather than writing directly.
 - Batch calling and single calling both go through the same `/api/outbound-call` endpoint on `server.py`.
-- Batch-calling durable state (campaigns, campaign leads, call attempts, idempotency, stale-attempt recovery) requires `schema_campaigns.sql` to have been run against Supabase — `call_handler_app/campaigns.py` will 500 on every request until it has.
+- The `/plivo/hangup` webhook updates both `calls.hangup_cause` and, if a matching campaign attempt exists, `call_attempts` + `campaign_leads.status` in the same request — no separate webhook needed for batch calls.
